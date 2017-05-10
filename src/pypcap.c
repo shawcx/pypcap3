@@ -429,7 +429,7 @@ static PyObject * pypcap_loop(PyPCAP_Object *self, PyObject *pyoParams) {
     _pyhandler = signal(SIGINT, sig_handler);
     ok = pcap_loop(self->pd, cnt, pypcap_handler, (u_char *)pyoCallback);
     signal(SIGINT, _pyhandler);
-    
+
     Py_RETURN_NONE;
 }
 
@@ -475,20 +475,18 @@ static PyObject * pypcap_sendpacket(PyPCAP_Object *self, PyObject *pyoPacket) {
     ssize_t len;
     int ok;
 
-    ok = PyBytes_Check(pyoPacket);
-    if(FALSE == ok) {
-        PyErr_SetString(PyExc_TypeError, "Value must be bytes.");
+    ok = PyBytes_AsStringAndSize(pyoPacket, &data, &len);
+    if(0 > ok) {
         return NULL;
     }
 
-    PyBytes_AsStringAndSize(pyoPacket, &data, &len);
-    ok = pcap_sendpacket(self->pd, (u_char *)data, len);
-    if(0 == ok) {
-        return Py_BuildValue("i", len);
+    ok = pcap_inject(self->pd, (u_char *)data, len);
+    if(0 > ok) {
+        PyErr_SetString(PyExc_IOError, pcap_geterr(self->pd));
+        return NULL;
     }
-    else {
-        Py_RETURN_NONE;
-    }
+
+    return Py_BuildValue("i", ok);
 }
 
 #ifdef WIN32
@@ -496,12 +494,8 @@ static PyObject * pypcap_getevent(PyPCAP_Object *self) {
     CTXCHECK;
     return Py_BuildValue("i", pcap_getevent(self->pd));
 }
-#endif // WIN32
 
-
-#ifdef WIN32
 // Code that allows you to open a device by the name (e.g. Local Area Connection) instead of a GUID on Windows
-
 #define REG_NETWORK_CANON "SYSTEM\\CurrentControlSet\\Control\\Network\\{4D36E972-E325-11CE-BFC1-08002BE10318}"
 
 static int get_canonical(char *guid, char *name) {
