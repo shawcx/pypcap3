@@ -389,7 +389,14 @@ static PyObject * pypcap_setdirection(PyPCAP_Object *self, PyObject *pyoDirectio
 }
 
 void pypcap_handler(u_char *user, const struct pcap_pkthdr *pkt_header, const u_char *pkt_data) {
-    Py_DECREF(PyObject_CallFunction((PyObject *)user, "y#", pkt_data, pkt_header->caplen));
+    PyObject *retval;
+    retval = PyObject_CallFunction((PyObject *)user, "y#", pkt_data, pkt_header->caplen);
+    if(retval) {
+        Py_DECREF(retval);
+    } else {
+        PyErr_Print();
+        PyErr_Clear();
+    }
 }
 
 //
