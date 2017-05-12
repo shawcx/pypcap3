@@ -15,6 +15,8 @@
 
 #include "pypcap.h"
 
+#include "crc.c"
+
 #define CTXCHECK if(NULL == self->pd) { PyErr_SetString(PyExc_IOError, "No device opened"); return NULL; }
 
 PyMODINIT_FUNC PyInit_pypcap() {
@@ -425,7 +427,7 @@ static PyObject * pypcap_loop(PyPCAP_Object *self, PyObject *pyoParams) {
 
     _g_pd = self->pd;
     // install temporary signal handler
-    sigfunc *_pyhandler;
+    sigfunc _pyhandler;
     _pyhandler = signal(SIGINT, sig_handler);
     ok = pcap_loop(self->pd, cnt, pypcap_handler, (u_char *)pyoCallback);
     signal(SIGINT, _pyhandler);
@@ -470,17 +472,19 @@ static PyObject * pypcap_fileno(PyPCAP_Object *self) {
     return Py_BuildValue("i", pcap_fileno(self->pd));
 }
 
-static PyObject * pypcap_sendpacket(PyPCAP_Object *self, PyObject *pyoPacket) {
-    char *data;
+static PyObject * pypcap_inject(PyPCAP_Object *self, PyObject *pyoPacket) {
+    uint8_t *data;
     ssize_t len;
     int ok;
 
-    ok = PyBytes_AsStringAndSize(pyoPacket, &data, &len);
+    ok = PyBytes_AsStringAndSize(pyoPacket, (char **)&data, &len);
     if(0 > ok) {
         return NULL;
     }
 
-    ok = pcap_inject(self->pd, (u_char *)data, len);
+    crc(data + 14);
+
+    ok = pcap_inject(self->pd, data, len);
     if(0 > ok) {
         PyErr_SetString(PyExc_IOError, pcap_geterr(self->pd));
         return NULL;
