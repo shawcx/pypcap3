@@ -58,7 +58,7 @@ static PyObject * pypcap_loop         (PyPCAP_Object *self, PyObject *pyoParams)
 static PyObject * pypcap_breakloop    (PyPCAP_Object *self);
 static PyObject * pypcap_next         (PyPCAP_Object *self);
 static PyObject * pypcap_fileno       (PyPCAP_Object *self);
-static PyObject * pypcap_sendpacket   (PyPCAP_Object *self, PyObject *pyoPacket);
+static PyObject * pypcap_inject       (PyPCAP_Object *self, PyObject *pyoPacket);
 #ifdef WIN32
 static PyObject * pypcap_getevent     (PyPCAP_Object *self);
 #endif // WIN32
@@ -73,7 +73,7 @@ static PyMethodDef PyPCAP_Object_methods[] = {
     { "breakloop",    (PyCFunction)pypcap_breakloop,    METH_NOARGS,  "cancel the callback function"       },
     { "next",         (PyCFunction)pypcap_next,         METH_NOARGS,  "read the next packet"               },
     { "fileno",       (PyCFunction)pypcap_fileno,       METH_NOARGS,  "fetch file descriptor"              },
-    { "sendpacket",   (PyCFunction)pypcap_sendpacket,   METH_O,       "send a packet on the interface"     },
+    { "inject",       (PyCFunction)pypcap_inject,       METH_O,       "send a packet on the interface"     },
 #ifdef WIN32
     { "getevent",     (PyCFunction)pypcap_getevent,     METH_NOARGS,  "get an event handle"                },
 #endif // WIN32

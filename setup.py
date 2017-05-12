@@ -20,7 +20,7 @@ else:
     include = []
     libs    = ['pcap']
 
-source_files = glob.glob('./src/*.c')
+source_files = glob.glob('./src/pypcap.c')
 
 setuptools.setup(
     name             = 'pypcap',
