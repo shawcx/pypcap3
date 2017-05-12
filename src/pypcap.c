@@ -15,8 +15,6 @@
 
 #include "pypcap.h"
 
-#include "crc.c"
-
 #define CTXCHECK if(NULL == self->pd) { PyErr_SetString(PyExc_IOError, "No device opened"); return NULL; }
 
 PyMODINIT_FUNC PyInit_pypcap() {
@@ -488,8 +486,6 @@ static PyObject * pypcap_inject(PyPCAP_Object *self, PyObject *pyoPacket) {
     if(0 > ok) {
         return NULL;
     }
-
-    crc(data + 14);
 
     ok = pcap_inject(self->pd, data, len);
     if(0 > ok) {
