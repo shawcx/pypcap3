@@ -23,7 +23,7 @@ else:
 source_files = glob.glob('./src/pypcap.c')
 
 setuptools.setup(
-    name             = 'pypcap',
+    name             = 'pypcap3',
     author           = 'Matthew Oertle',
     author_email     = 'moertle@gmail.com',
     version          = '0.2',
