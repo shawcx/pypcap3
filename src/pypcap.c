@@ -3,7 +3,9 @@
 #else // !WIN32
  #include <arpa/inet.h>
  #include <net/if.h>
+#ifdef MACOS
  #include <net/if_dl.h>
+#endif
  #include <netinet/in.h>
  #include <sys/ioctl.h>
  #include <sys/socket.h>
@@ -196,17 +198,13 @@ static PyObject * PyPCAP_mac(PyObject *self, PyObject *pyoInterface) {
     free(buff);
 
     return PyBytes_FromStringAndSize((char *)ptr, 6);
-#endif // MACOS
-
-#ifdef LINUX
+#else // LINUX
     struct ifreq ifr;
     int fd;
 
     ifr.ifr_addr.sa_family = AF_INET;
     strncpy(ifr.ifr_name, PyUnicode_AsUTF8(pyoInterface), IFNAMSIZ-1);
     ifr.ifr_name[IFNAMSIZ-1] = 0;
-
-    Py_DECREF(pyoAscii);
 
     fd = socket(AF_INET, SOCK_DGRAM, 0);
     if(0 > fd) {
