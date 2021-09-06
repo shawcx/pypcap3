@@ -148,7 +148,7 @@ static PyObject * pypcap_mac(PyObject *self, PyObject *pyoInterface) {
 
     ok = PyUnicode_Check(pyoInterface);
     if(FALSE == ok) {
-        PyErr_SetString(PyExc_TypeError, "Value must be a string.");
+        PyErr_SetString(PyExc_TypeError, "Value must be a string");
         return NULL;
     }
 
@@ -278,7 +278,7 @@ static PyPCAP * pypcap_open_file(PyObject *self, PyObject *pyoFilename) {
 
     ok = PyUnicode_Check(pyoFilename);
     if(FALSE == ok) {
-        PyErr_SetString(PyExc_TypeError, "Value must be a string.");
+        PyErr_SetString(PyExc_TypeError, "Value must be a string");
         return NULL;
     }
 

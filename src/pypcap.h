@@ -37,17 +37,17 @@ static PyMethodDef PyPCAP_methods[] = {
     { "find",      (PyCFunction)pypcap_find,      METH_NOARGS,  "find suitable devices in a system" },
     { "mac",       (PyCFunction)pypcap_mac,       METH_O,       "MAC address of an interface"       },
     { "open_live", (PyCFunction)pypcap_open_live, METH_VARARGS, "open an interface"                 },
-    { "open_file", (PyCFunction)pypcap_open_file, METH_VARARGS, "open a file"                       },
+    { "open_file", (PyCFunction)pypcap_open_file, METH_O,       "open a file"                       },
     { "create",    (PyCFunction)pypcap_create,    METH_O,       "create a live capture handle"      },
     { NULL }
 };
 
 static PyModuleDef PyPCAP_module = {
     PyModuleDef_HEAD_INIT,
-    .m_name  = "pypcap",
-    .m_doc   = NULL,
-    .m_size  = -1,
-    .m_slots = PyPCAP_methods
+    .m_name    = "pypcap",
+    .m_doc     = NULL,
+    .m_size    = -1,
+    .m_methods = PyPCAP_methods
 };
 
 
