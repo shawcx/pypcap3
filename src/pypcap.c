@@ -355,6 +355,18 @@ static PyObject * pypcap_close(PyPCAP_Object *self) {
     }
     Py_RETURN_NONE;
 }
+static PyObject * pypcap_stats(PyPCAP_Object *self) {
+    struct pcap_stat ps;
+
+    CTXCHECK
+
+    if(-1 == pcap_stats(self->pd, &ps)) {
+        PyErr_SetString(PyExc_IOError, pcap_geterr(self->pd));
+        return NULL;
+    }
+
+    return Py_BuildValue("III", ps.ps_recv, ps.ps_drop, ps.ps_ifdrop);
+}
 
 static PyObject * pypcap_geterr(PyPCAP_Object *self) {
     return PyUnicode_FromString(pcap_geterr(self->pd));
@@ -369,15 +381,13 @@ static PyObject * pypcap_list_datalinks(PyPCAP_Object *self) {
 
     CTXCHECK
 
-    printf(">>>>> %p / %p\n", self, self->pd);
     len = pcap_list_datalinks(self->pd, &dlts);
-    printf(">>>>> %d\n", len);
     if(0 > len) {
         PyErr_SetString(PyExc_IOError, pcap_geterr(self->pd));
         return NULL;
     }
 
-    //links = PyList_New(0); //len);
+    links = PyList_New(len);
 
     for(idx = 0; idx < len; ++idx) {
         printf("... %d %s %s\n",
@@ -385,17 +395,16 @@ static PyObject * pypcap_list_datalinks(PyPCAP_Object *self) {
             pcap_datalink_val_to_name(dlts[idx]),
             pcap_datalink_val_to_description(dlts[idx])
             );
-        //value = PyTuple_New(3);
-        //PyTuple_SET_ITEM(value, 0, PyLong_FromLong(dlts[idx]));
-        //PyTuple_SET_ITEM(value, 1, PyUnicode_FromString(pcap_datalink_val_to_name(dlts[idx])));
-        //PyTuple_SET_ITEM(value, 2, PyUnicode_FromString(pcap_datalink_val_to_description(dlts[idx])));
-        //PyList_SET_ITEM(links, idx, value);
+        value = PyTuple_New(3);
+        PyTuple_SET_ITEM(value, 0, PyLong_FromLong(dlts[idx]));
+        PyTuple_SET_ITEM(value, 1, PyUnicode_FromString(pcap_datalink_val_to_name(dlts[idx])));
+        PyTuple_SET_ITEM(value, 2, PyUnicode_FromString(pcap_datalink_val_to_description(dlts[idx])));
+        PyList_SET_ITEM(links, idx, value);
     }
 
     pcap_free_datalinks(dlts);
 
-    Py_RETURN_NONE;
-    //return links;
+    return links;
 }
 
 static PyObject * pypcap_datalink(PyPCAP_Object *self) {
@@ -432,7 +441,7 @@ static PyObject * pypcap_getnonblock(PyPCAP_Object *self) {
     char szErrBuf[PCAP_ERRBUF_SIZE];
     int block;
 
-    CTXCHECK;
+    CTXCHECK
 
     block = pcap_getnonblock(self->pd, szErrBuf);
     if(0 > block) {
@@ -450,7 +459,7 @@ static PyObject * pypcap_setdirection(PyPCAP_Object *self, PyObject *pyoDirectio
     long nDirection;
     int ok;
 
-    CTXCHECK;
+    CTXCHECK
 
     ok = PyLong_Check(pyoDirection);
     if(FALSE == ok) {
@@ -493,7 +502,7 @@ static PyObject * pypcap_loop(PyPCAP_Object *self, PyObject *pyoParams) {
     int cnt = -1;
     int ok;
 
-    CTXCHECK;
+    CTXCHECK
 
     ok = PyArg_ParseTuple(pyoParams, "O|i", &pyoCallback, &cnt);
     if(FALSE == ok) {
@@ -518,7 +527,7 @@ static PyObject * pypcap_loop(PyPCAP_Object *self, PyObject *pyoParams) {
 }
 
 static PyObject * pypcap_breakloop(PyPCAP_Object *self) {
-    CTXCHECK;
+    CTXCHECK
     pcap_breakloop(self->pd);
     Py_RETURN_NONE;
 }
@@ -550,7 +559,7 @@ static PyObject * pypcap_next(PyPCAP_Object *self) {
 }
 
 static PyObject * pypcap_fileno(PyPCAP_Object *self) {
-    CTXCHECK;
+    CTXCHECK
     return Py_BuildValue("i", pcap_fileno(self->pd));
 }
 
@@ -575,7 +584,7 @@ static PyObject * pypcap_inject(PyPCAP_Object *self, PyObject *pyoPacket) {
 
 #ifdef WIN32
 static PyObject * pypcap_getevent(PyPCAP_Object *self) {
-    CTXCHECK;
+    CTXCHECK
     return Py_BuildValue("i", pcap_getevent(self->pd));
 }
 

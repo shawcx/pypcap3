@@ -53,6 +53,7 @@ static void PyPCAP_dealloc(PyPCAP_Object *self);
 
 static PyObject * pypcap_activate       (PyPCAP_Object *self);
 static PyObject * pypcap_close          (PyPCAP_Object *self);
+static PyObject * PyPCAP_stats          (PyPCAP_Object *self);
 static PyObject * pypcap_geterr         (PyPCAP_Object *self);
 static PyObject * pypcap_list_datalinks (PyPCAP_Object *self);
 static PyObject * pypcap_datalink       (PyPCAP_Object *self);
@@ -69,8 +70,9 @@ static PyObject * pypcap_getevent       (PyPCAP_Object *self);
 #endif // WIN32
 
 static PyMethodDef PyPCAP_Object_methods[] = {
-    { "activate",      (PyCFunction)pypcap_activate,       METH_NOARGS,  "activate an interface"                 },
+    { "activate",      (PyCFunction)pypcap_activate,       METH_NOARGS,  "activate an interface"              },
     { "close",         (PyCFunction)pypcap_close,          METH_NOARGS,  "close an interface"                 },
+    { "stats",         (PyCFunction)pypcap_stats,          METH_NOARGS,  "get stats from a sessions"          },
     { "geterr",        (PyCFunction)pypcap_geterr,         METH_NOARGS,  "print the last error"               },
     { "list_datalinks",(PyCFunction)pypcap_list_datalinks, METH_NOARGS,  "return list of supported datalinks" },
     { "datalink",      (PyCFunction)pypcap_datalink,       METH_NOARGS,  "get datalink"                       },
