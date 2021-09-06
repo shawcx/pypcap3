@@ -28,6 +28,7 @@ static PyObject * PyPCAP_mac       (PyObject * self, PyObject * pyoInterface);
 
 static PyPCAP_Object * PyPCAP_open_live (PyObject * self, PyObject * pyoParams);
 static PyPCAP_Object * PyPCAP_open_file (PyObject * self, PyObject * pyoParams);
+static PyPCAP_Object * PyPCAP_create    (PyObject * self, PyObject * pyoParams);
 
 static PyMethodDef PyPCAP_methods[] = {
     { "version",   (PyCFunction)PyPCAP_version,   METH_NOARGS,  "return the version"                },
@@ -35,6 +36,7 @@ static PyMethodDef PyPCAP_methods[] = {
     { "mac",       (PyCFunction)PyPCAP_mac,       METH_O,       "MAC address of an interface"       },
     { "open_live", (PyCFunction)PyPCAP_open_live, METH_VARARGS, "open an interface"                 },
     { "open_file", (PyCFunction)PyPCAP_open_file, METH_VARARGS, "open a file"                       },
+    { "create",    (PyCFunction)PyPCAP_create,    METH_O,       "create a live capture handle"      },
     { NULL }
 };
 
@@ -49,33 +51,39 @@ static PyModuleDef PyPCAP_module = {
 
 static void PyPCAP_dealloc(PyPCAP_Object *self);
 
-static PyObject * pypcap_close        (PyPCAP_Object *self);
-static PyObject * pypcap_geterr       (PyPCAP_Object *self);
-static PyObject * pypcap_setnonblock  (PyPCAP_Object *self, PyObject *pyoBlocking);
-static PyObject * pypcap_getnonblock  (PyPCAP_Object *self);
-static PyObject * pypcap_setdirection (PyPCAP_Object *self, PyObject *pyoDirection);
-static PyObject * pypcap_loop         (PyPCAP_Object *self, PyObject *pyoParams);
-static PyObject * pypcap_breakloop    (PyPCAP_Object *self);
-static PyObject * pypcap_next         (PyPCAP_Object *self);
-static PyObject * pypcap_fileno       (PyPCAP_Object *self);
-static PyObject * pypcap_inject       (PyPCAP_Object *self, PyObject *pyoPacket);
+static PyObject * pypcap_activate       (PyPCAP_Object *self);
+static PyObject * pypcap_close          (PyPCAP_Object *self);
+static PyObject * pypcap_geterr         (PyPCAP_Object *self);
+static PyObject * pypcap_list_datalinks (PyPCAP_Object *self);
+static PyObject * pypcap_datalink       (PyPCAP_Object *self);
+static PyObject * pypcap_setnonblock    (PyPCAP_Object *self, PyObject *pyoBlocking);
+static PyObject * pypcap_getnonblock    (PyPCAP_Object *self);
+static PyObject * pypcap_setdirection   (PyPCAP_Object *self, PyObject *pyoDirection);
+static PyObject * pypcap_loop           (PyPCAP_Object *self, PyObject *pyoParams);
+static PyObject * pypcap_breakloop      (PyPCAP_Object *self);
+static PyObject * pypcap_next           (PyPCAP_Object *self);
+static PyObject * pypcap_fileno         (PyPCAP_Object *self);
+static PyObject * pypcap_inject         (PyPCAP_Object *self, PyObject *pyoPacket);
 #ifdef WIN32
-static PyObject * pypcap_getevent     (PyPCAP_Object *self);
+static PyObject * pypcap_getevent       (PyPCAP_Object *self);
 #endif // WIN32
 
 static PyMethodDef PyPCAP_Object_methods[] = {
-    { "close",        (PyCFunction)pypcap_close,        METH_NOARGS,  "close an interface"                 },
-    { "geterr",       (PyCFunction)pypcap_geterr,       METH_NOARGS,  "print the last error"               },
-    { "setnonblock",  (PyCFunction)pypcap_setnonblock,  METH_O,       "set blocking or non-blocking"       },
-    { "getnonblock",  (PyCFunction)pypcap_getnonblock,  METH_NOARGS,  "get blocking state"                 },
-    { "setdirection", (PyCFunction)pypcap_setdirection, METH_O,       "set the direction of a capture"     },
-    { "loop",         (PyCFunction)pypcap_loop,         METH_VARARGS, "call a callback function on packet" },
-    { "breakloop",    (PyCFunction)pypcap_breakloop,    METH_NOARGS,  "cancel the callback function"       },
-    { "next",         (PyCFunction)pypcap_next,         METH_NOARGS,  "read the next packet"               },
-    { "fileno",       (PyCFunction)pypcap_fileno,       METH_NOARGS,  "fetch file descriptor"              },
-    { "inject",       (PyCFunction)pypcap_inject,       METH_O,       "send a packet on the interface"     },
+    { "activate",      (PyCFunction)pypcap_activate,       METH_NOARGS,  "activate an interface"                 },
+    { "close",         (PyCFunction)pypcap_close,          METH_NOARGS,  "close an interface"                 },
+    { "geterr",        (PyCFunction)pypcap_geterr,         METH_NOARGS,  "print the last error"               },
+    { "list_datalinks",(PyCFunction)pypcap_list_datalinks, METH_NOARGS,  "return list of supported datalinks" },
+    { "datalink",      (PyCFunction)pypcap_datalink,       METH_NOARGS,  "get datalink"                       },
+    { "setnonblock",   (PyCFunction)pypcap_setnonblock,    METH_O,       "set blocking or non-blocking"       },
+    { "getnonblock",   (PyCFunction)pypcap_getnonblock,    METH_NOARGS,  "get blocking state"                 },
+    { "setdirection",  (PyCFunction)pypcap_setdirection,   METH_O,       "set the direction of a capture"     },
+    { "loop",          (PyCFunction)pypcap_loop,           METH_VARARGS, "call a callback function on packet" },
+    { "breakloop",     (PyCFunction)pypcap_breakloop,      METH_NOARGS,  "cancel the callback function"       },
+    { "next",          (PyCFunction)pypcap_next,           METH_NOARGS,  "read the next packet"               },
+    { "fileno",        (PyCFunction)pypcap_fileno,         METH_NOARGS,  "fetch file descriptor"              },
+    { "inject",        (PyCFunction)pypcap_inject,         METH_O,       "send a packet on the interface"     },
 #ifdef WIN32
-    { "getevent",     (PyCFunction)pypcap_getevent,     METH_NOARGS,  "get an event handle"                },
+    { "getevent",      (PyCFunction)pypcap_getevent,       METH_NOARGS,  "get an event handle"                },
 #endif // WIN32
     { NULL }
 };

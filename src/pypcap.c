@@ -9,7 +9,7 @@
  #include <netinet/in.h>
  #include <sys/ioctl.h>
  #include <sys/socket.h>
- #include <sys/sysctl.h>
+// #include <sys/sysctl.h>
  #include <sys/types.h>
  #include <errno.h>
  #include <signal.h>
@@ -301,6 +301,33 @@ static PyPCAP_Object * PyPCAP_open_file(PyObject *self, PyObject *pyoParams) {
     return pypcap;
 }
 
+static PyPCAP_Object * PyPCAP_create(PyObject *self, PyObject *pyoDevice) {
+    PyPCAP_Object *pypcap;
+
+    char *szDevice = NULL;
+    char szErrBuf[PCAP_ERRBUF_SIZE];
+    int ok;
+
+    ok = PyUnicode_Check(pyoDevice);
+    if(FALSE == ok) {
+        PyErr_SetString(PyExc_TypeError, "Value must be a string.");
+        return NULL;
+    }
+
+    pypcap = PyObject_New(PyPCAP_Object, &PyPCAP_Type);
+    if(NULL == pypcap) {
+        return NULL;
+    }
+
+    pypcap->pd = pcap_create(PyUnicode_AsUTF8(pyoDevice), szErrBuf);
+    if(NULL == pypcap->pd) {
+        PyErr_SetString(PyExc_IOError, szErrBuf);
+        return NULL;
+    }
+
+    return pypcap;
+}
+
 /*
  *  PyPCAP Object Functions
  */
@@ -314,6 +341,13 @@ static void PyPCAP_dealloc(PyPCAP_Object *self) {
     PyObject_Del(self);
 }
 
+static PyObject * pypcap_activate(PyPCAP_Object *self) {
+    int ok;
+    ok = pcap_activate(self->pd);
+    Py_RETURN_NONE;
+}
+
+
 static PyObject * pypcap_close(PyPCAP_Object *self) {
     if(NULL != self->pd) {
         pcap_close(self->pd);
@@ -326,12 +360,57 @@ static PyObject * pypcap_geterr(PyPCAP_Object *self) {
     return PyUnicode_FromString(pcap_geterr(self->pd));
 }
 
+static PyObject * pypcap_list_datalinks(PyPCAP_Object *self) {
+    PyObject *links;
+    PyObject *value;
+    int *dlts;
+    int len;
+    int idx;
+
+    CTXCHECK
+
+    printf(">>>>> %p / %p\n", self, self->pd);
+    len = pcap_list_datalinks(self->pd, &dlts);
+    printf(">>>>> %d\n", len);
+    if(0 > len) {
+        PyErr_SetString(PyExc_IOError, pcap_geterr(self->pd));
+        return NULL;
+    }
+
+    //links = PyList_New(0); //len);
+
+    for(idx = 0; idx < len; ++idx) {
+        printf("... %d %s %s\n",
+            dlts[idx],
+            pcap_datalink_val_to_name(dlts[idx]),
+            pcap_datalink_val_to_description(dlts[idx])
+            );
+        //value = PyTuple_New(3);
+        //PyTuple_SET_ITEM(value, 0, PyLong_FromLong(dlts[idx]));
+        //PyTuple_SET_ITEM(value, 1, PyUnicode_FromString(pcap_datalink_val_to_name(dlts[idx])));
+        //PyTuple_SET_ITEM(value, 2, PyUnicode_FromString(pcap_datalink_val_to_description(dlts[idx])));
+        //PyList_SET_ITEM(links, idx, value);
+    }
+
+    pcap_free_datalinks(dlts);
+
+    Py_RETURN_NONE;
+    //return links;
+}
+
+static PyObject * pypcap_datalink(PyPCAP_Object *self) {
+    int dlt;
+    CTXCHECK
+    dlt = pcap_datalink(self->pd);
+    return Py_BuildValue("iss", dlt, pcap_datalink_val_to_name(dlt), pcap_datalink_val_to_description(dlt));
+}
+
 static PyObject * pypcap_setnonblock(PyPCAP_Object *self, PyObject *pyoBlocking) {
     char szErrBuf[PCAP_ERRBUF_SIZE];
     long block;
     int ok;
 
-    CTXCHECK;
+    CTXCHECK
 
     ok = PyLong_Check(pyoBlocking);
     if(FALSE == ok) {
