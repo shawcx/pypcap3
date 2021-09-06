@@ -47,11 +47,11 @@ PyMODINIT_FUNC PyInit_pypcap() {
  *  PyPCAP Module Functions
  */
 
-static PyObject * PyPCAP_version(PyObject *self) {
+static PyObject * pypcap_version(PyObject *self) {
     return PyUnicode_FromString(pcap_lib_version());
 }
 
-static PyObject * PyPCAP_find(PyObject *self) {
+static PyObject * pypcap_find(PyObject *self) {
     PyObject *pyoDevDict;
     PyObject *pyoAddrDict;
     PyObject *pyoNameString;
@@ -63,7 +63,7 @@ static PyObject * PyPCAP_find(PyObject *self) {
     struct sockaddr *sa;
     struct sockaddr_in *sai;
 
-    char szErrBuf[PCAP_ERRBUF_SIZE];
+    char errbuf[PCAP_ERRBUF_SIZE];
     int ok;
 
 #ifdef WIN32
@@ -71,9 +71,9 @@ static PyObject * PyPCAP_find(PyObject *self) {
 #endif // WIN32
 
     // Returns a linked list of all devices in the system
-    ok = pcap_findalldevs(&devices, szErrBuf);
+    ok = pcap_findalldevs(&devices, errbuf);
     if(0 > ok) {
-        PyErr_SetString(PyExc_IOError, szErrBuf);
+        PyErr_SetString(PyExc_IOError, errbuf);
         return NULL;
     }
 
@@ -143,7 +143,7 @@ static PyObject * PyPCAP_find(PyObject *self) {
     return pyoDevDict;
 }
 
-static PyObject * PyPCAP_mac(PyObject *self, PyObject *pyoInterface) {
+static PyObject * pypcap_mac(PyObject *self, PyObject *pyoInterface) {
     int ok;
 
     ok = PyUnicode_Check(pyoInterface);
@@ -224,14 +224,12 @@ static PyObject * PyPCAP_mac(PyObject *self, PyObject *pyoInterface) {
 
 }
 
-static PyPCAP_Object * PyPCAP_open_live(PyObject *self, PyObject *pyoParams) {
-    PyPCAP_Object *pypcap;
-
+static PyPCAP * pypcap_open_live(PyObject *self, PyObject *pyoParams) {
     char *szDevice = NULL;
     int snaplen = DEFAULT_SNAPLEN;
     int promisc = DEFAULT_PROMISC;
     int to_ms = DEFAULT_TO_MS;
-    char szErrBuf[PCAP_ERRBUF_SIZE];
+    char errbuf[PCAP_ERRBUF_SIZE];
     int ok;
 #ifdef WIN32
     char guid[MAX_PATH];
@@ -250,18 +248,18 @@ static PyPCAP_Object * PyPCAP_open_live(PyObject *self, PyObject *pyoParams) {
     }
 #endif // WIN32
 
-    pypcap = PyObject_New(PyPCAP_Object, &PyPCAP_Type);
+    PyPCAP *pypcap = (PyPCAP *)PyObject_CallObject((PyObject *)&PyPCAP_Type, NULL);
     if(NULL == pypcap) {
         return NULL;
     }
 
 #ifdef WIN32
-    pypcap->pd = pcap_open_live(guid, snaplen, promisc, to_ms, szErrBuf);
+    pypcap->pd = pcap_open_live(guid, snaplen, promisc, to_ms, errbuf);
 #else
-    pypcap->pd = pcap_open_live(szDevice, snaplen, promisc, to_ms, szErrBuf);
+    pypcap->pd = pcap_open_live(szDevice, snaplen, promisc, to_ms, errbuf);
 #endif
     if(NULL == pypcap->pd) {
-        PyErr_SetString(PyExc_IOError, szErrBuf);
+        PyErr_SetString(PyExc_IOError, errbuf);
         return NULL;
     }
 
@@ -274,38 +272,32 @@ static PyPCAP_Object * PyPCAP_open_live(PyObject *self, PyObject *pyoParams) {
     return pypcap;
 }
 
-static PyPCAP_Object * PyPCAP_open_file(PyObject *self, PyObject *pyoParams) {
-    PyPCAP_Object *pypcap;
-
-    char *szFileName = NULL;
-    char szErrBuf[PCAP_ERRBUF_SIZE];
+static PyPCAP * pypcap_open_file(PyObject *self, PyObject *pyoFilename) {
+    char errbuf[PCAP_ERRBUF_SIZE];
     int ok;
 
-    ok = PyArg_ParseTuple(pyoParams, "s", &szFileName);
+    ok = PyUnicode_Check(pyoFilename);
     if(FALSE == ok) {
-        PyErr_SetString(PyExc_TypeError, "String expected");
+        PyErr_SetString(PyExc_TypeError, "Value must be a string.");
         return NULL;
     }
 
-    pypcap = PyObject_New(PyPCAP_Object, &PyPCAP_Type);
+    PyPCAP *pypcap = (PyPCAP *)PyObject_CallObject((PyObject *)&PyPCAP_Type, NULL);
     if(NULL == pypcap) {
         return NULL;
     }
 
-    pypcap->pd = pcap_open_offline(szFileName, szErrBuf);
+    pypcap->pd = pcap_open_offline(PyUnicode_AsUTF8(pyoFilename), errbuf);
     if(NULL == pypcap->pd) {
-        PyErr_SetString(PyExc_IOError, szErrBuf);
+        PyErr_SetString(PyExc_IOError, errbuf);
         return NULL;
     }
 
     return pypcap;
 }
 
-static PyPCAP_Object * PyPCAP_create(PyObject *self, PyObject *pyoDevice) {
-    PyPCAP_Object *pypcap;
-
-    char *szDevice = NULL;
-    char szErrBuf[PCAP_ERRBUF_SIZE];
+static PyPCAP * pypcap_create(PyObject *self, PyObject *pyoDevice) {
+    char errbuf[PCAP_ERRBUF_SIZE];
     int ok;
 
     ok = PyUnicode_Check(pyoDevice);
@@ -314,14 +306,14 @@ static PyPCAP_Object * PyPCAP_create(PyObject *self, PyObject *pyoDevice) {
         return NULL;
     }
 
-    pypcap = PyObject_New(PyPCAP_Object, &PyPCAP_Type);
+    PyPCAP *pypcap = (PyPCAP *)PyObject_CallObject((PyObject *)&PyPCAP_Type, NULL);
     if(NULL == pypcap) {
         return NULL;
     }
 
-    pypcap->pd = pcap_create(PyUnicode_AsUTF8(pyoDevice), szErrBuf);
+    pypcap->pd = pcap_create(PyUnicode_AsUTF8(pyoDevice), errbuf);
     if(NULL == pypcap->pd) {
-        PyErr_SetString(PyExc_IOError, szErrBuf);
+        PyErr_SetString(PyExc_IOError, errbuf);
         return NULL;
     }
 
@@ -333,7 +325,12 @@ static PyPCAP_Object * PyPCAP_create(PyObject *self, PyObject *pyoDevice) {
  */
 
 
-static void PyPCAP_dealloc(PyPCAP_Object *self) {
+static int pypcap_init(PyPCAP *self, PyObject *args, PyObject *kwds) {
+    self->pd = NULL;
+    return 0;
+}
+
+static void pypcap_dealloc(PyPCAP *self) {
     if(NULL != self->pd) {
         pcap_close(self->pd);
         self->pd = NULL;
@@ -341,21 +338,30 @@ static void PyPCAP_dealloc(PyPCAP_Object *self) {
     PyObject_Del(self);
 }
 
-static PyObject * pypcap_activate(PyPCAP_Object *self) {
+static PyObject * pypcap_activate(PyPCAP *self) {
     int ok;
     ok = pcap_activate(self->pd);
+    if(0 > ok) {
+        PyErr_SetString(PyExc_IOError, pcap_statustostr(ok));
+        return NULL;
+    }
+    else if(0 < ok) {
+        return PyUnicode_FromString(pcap_statustostr(ok));
+
+    }
     Py_RETURN_NONE;
 }
 
 
-static PyObject * pypcap_close(PyPCAP_Object *self) {
+static PyObject * pypcap_close(PyPCAP *self) {
     if(NULL != self->pd) {
         pcap_close(self->pd);
         self->pd = NULL;
     }
     Py_RETURN_NONE;
 }
-static PyObject * pypcap_stats(PyPCAP_Object *self) {
+
+static PyObject * pypcap_stats(PyPCAP *self) {
     struct pcap_stat ps;
 
     CTXCHECK
@@ -368,11 +374,11 @@ static PyObject * pypcap_stats(PyPCAP_Object *self) {
     return Py_BuildValue("III", ps.ps_recv, ps.ps_drop, ps.ps_ifdrop);
 }
 
-static PyObject * pypcap_geterr(PyPCAP_Object *self) {
+static PyObject * pypcap_geterr(PyPCAP *self) {
     return PyUnicode_FromString(pcap_geterr(self->pd));
 }
 
-static PyObject * pypcap_list_datalinks(PyPCAP_Object *self) {
+static PyObject * pypcap_list_datalinks(PyPCAP *self) {
     PyObject *links;
     PyObject *value;
     int *dlts;
@@ -407,15 +413,15 @@ static PyObject * pypcap_list_datalinks(PyPCAP_Object *self) {
     return links;
 }
 
-static PyObject * pypcap_datalink(PyPCAP_Object *self) {
+static PyObject * pypcap_datalink(PyPCAP *self) {
     int dlt;
     CTXCHECK
     dlt = pcap_datalink(self->pd);
     return Py_BuildValue("iss", dlt, pcap_datalink_val_to_name(dlt), pcap_datalink_val_to_description(dlt));
 }
 
-static PyObject * pypcap_setnonblock(PyPCAP_Object *self, PyObject *pyoBlocking) {
-    char szErrBuf[PCAP_ERRBUF_SIZE];
+static PyObject * pypcap_setnonblock(PyPCAP *self, PyObject *pyoBlocking) {
+    char errbuf[PCAP_ERRBUF_SIZE];
     long block;
     int ok;
 
@@ -428,31 +434,31 @@ static PyObject * pypcap_setnonblock(PyPCAP_Object *self, PyObject *pyoBlocking)
     }
 
     block = (int)PyLong_AsLong(pyoBlocking);
-    ok = pcap_setnonblock(self->pd, block, szErrBuf);
+    ok = pcap_setnonblock(self->pd, block, errbuf);
     if(0 > ok) {
-        PyErr_SetString(PyExc_IOError, szErrBuf);
+        PyErr_SetString(PyExc_IOError, errbuf);
         return NULL;
     }
 
     Py_RETURN_NONE;
 }
 
-static PyObject * pypcap_getnonblock(PyPCAP_Object *self) {
-    char szErrBuf[PCAP_ERRBUF_SIZE];
+static PyObject * pypcap_getnonblock(PyPCAP *self) {
+    char errbuf[PCAP_ERRBUF_SIZE];
     int block;
 
     CTXCHECK
 
-    block = pcap_getnonblock(self->pd, szErrBuf);
+    block = pcap_getnonblock(self->pd, errbuf);
     if(0 > block) {
-        PyErr_SetString(PyExc_IOError, szErrBuf);
+        PyErr_SetString(PyExc_IOError, errbuf);
         return NULL;
     }
 
-    return Py_BuildValue("i", block);
+    return PyLong_FromLong(block);
 }
 
-static PyObject * pypcap_setdirection(PyPCAP_Object *self, PyObject *pyoDirection) {
+static PyObject * pypcap_setdirection(PyPCAP *self, PyObject *pyoDirection) {
 #ifdef WIN32
     Py_RETURN_FALSE;
 #else // !WIN32
@@ -497,7 +503,7 @@ void sig_handler(int signo) {
     }
 }
 
-static PyObject * pypcap_loop(PyPCAP_Object *self, PyObject *pyoParams) {
+static PyObject * pypcap_loop(PyPCAP *self, PyObject *pyoParams) {
     PyObject *pyoCallback;
     int cnt = -1;
     int ok;
@@ -526,13 +532,13 @@ static PyObject * pypcap_loop(PyPCAP_Object *self, PyObject *pyoParams) {
     Py_RETURN_NONE;
 }
 
-static PyObject * pypcap_breakloop(PyPCAP_Object *self) {
+static PyObject * pypcap_breakloop(PyPCAP *self) {
     CTXCHECK
     pcap_breakloop(self->pd);
     Py_RETURN_NONE;
 }
 
-static PyObject * pypcap_next(PyPCAP_Object *self) {
+static PyObject * pypcap_next(PyPCAP *self) {
     struct pcap_pkthdr *hdr;
     const u_char *data;
     int ok;
@@ -544,7 +550,7 @@ static PyObject * pypcap_next(PyPCAP_Object *self) {
     switch(ok) {
     case 1:
         // TODO: do something more with the header...
-        return Py_BuildValue("y#", data, hdr->caplen);
+        return PyBytes_FromStringAndSize((const char *)data, hdr->caplen);
     case 0:
     case -2:
         // case 0 and -2 should be mutually exclusive, so None has the same meaning...
@@ -558,12 +564,12 @@ static PyObject * pypcap_next(PyPCAP_Object *self) {
     return NULL;
 }
 
-static PyObject * pypcap_fileno(PyPCAP_Object *self) {
+static PyObject * pypcap_fileno(PyPCAP *self) {
     CTXCHECK
-    return Py_BuildValue("i", pcap_fileno(self->pd));
+    return PyLong_FromLong(pcap_fileno(self->pd));
 }
 
-static PyObject * pypcap_inject(PyPCAP_Object *self, PyObject *pyoPacket) {
+static PyObject * pypcap_inject(PyPCAP *self, PyObject *pyoPacket) {
     uint8_t *data;
     ssize_t len;
     int ok;
@@ -579,13 +585,13 @@ static PyObject * pypcap_inject(PyPCAP_Object *self, PyObject *pyoPacket) {
         return NULL;
     }
 
-    return Py_BuildValue("i", ok);
+    return PyLong_FromLong(ok);
 }
 
 #ifdef WIN32
-static PyObject * pypcap_getevent(PyPCAP_Object *self) {
+static PyObject * pypcap_getevent(PyPCAP *self) {
     CTXCHECK
-    return Py_BuildValue("i", pcap_getevent(self->pd));
+    return PyLong_FromLong(pcap_getevent(self->pd));
 }
 
 // Code that allows you to open a device by the name (e.g. Local Area Connection) instead of a GUID on Windows

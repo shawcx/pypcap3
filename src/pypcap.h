@@ -1,6 +1,8 @@
 #ifndef __PYPCAP_H__
 #define __PYPCAP_H__
 
+#define PY_SSIZE_T_CLEAN
+
 #include <Python.h>
 #include <structmember.h>
 #include <pcap.h>
@@ -20,56 +22,57 @@ PyMODINIT_FUNC PyInit_pypcap(void);
 typedef struct {
     PyObject_HEAD
     pcap_t *pd;
-} PyPCAP_Object;
+} PyPCAP;
 
-static PyObject * PyPCAP_version   (PyObject * self);
-static PyObject * PyPCAP_find      (PyObject * self);
-static PyObject * PyPCAP_mac       (PyObject * self, PyObject * pyoInterface);
+static PyObject * pypcap_version   (PyObject * self);
+static PyObject * pypcap_find      (PyObject * self);
+static PyObject * pypcap_mac       (PyObject * self, PyObject * pyoInterface);
 
-static PyPCAP_Object * PyPCAP_open_live (PyObject * self, PyObject * pyoParams);
-static PyPCAP_Object * PyPCAP_open_file (PyObject * self, PyObject * pyoParams);
-static PyPCAP_Object * PyPCAP_create    (PyObject * self, PyObject * pyoParams);
+static PyPCAP * pypcap_open_live (PyObject * self, PyObject * pyoParams);
+static PyPCAP * pypcap_open_file (PyObject * self, PyObject * pyoParams);
+static PyPCAP * pypcap_create    (PyObject * self, PyObject * pyoParams);
 
 static PyMethodDef PyPCAP_methods[] = {
-    { "version",   (PyCFunction)PyPCAP_version,   METH_NOARGS,  "return the version"                },
-    { "find",      (PyCFunction)PyPCAP_find,      METH_NOARGS,  "find suitable devices in a system" },
-    { "mac",       (PyCFunction)PyPCAP_mac,       METH_O,       "MAC address of an interface"       },
-    { "open_live", (PyCFunction)PyPCAP_open_live, METH_VARARGS, "open an interface"                 },
-    { "open_file", (PyCFunction)PyPCAP_open_file, METH_VARARGS, "open a file"                       },
-    { "create",    (PyCFunction)PyPCAP_create,    METH_O,       "create a live capture handle"      },
+    { "version",   (PyCFunction)pypcap_version,   METH_NOARGS,  "return the version"                },
+    { "find",      (PyCFunction)pypcap_find,      METH_NOARGS,  "find suitable devices in a system" },
+    { "mac",       (PyCFunction)pypcap_mac,       METH_O,       "MAC address of an interface"       },
+    { "open_live", (PyCFunction)pypcap_open_live, METH_VARARGS, "open an interface"                 },
+    { "open_file", (PyCFunction)pypcap_open_file, METH_VARARGS, "open a file"                       },
+    { "create",    (PyCFunction)pypcap_create,    METH_O,       "create a live capture handle"      },
     { NULL }
 };
 
 static PyModuleDef PyPCAP_module = {
     PyModuleDef_HEAD_INIT,
-    "pypcap",
-    NULL,
-    -1,
-    PyPCAP_methods
+    .m_name  = "pypcap",
+    .m_doc   = NULL,
+    .m_size  = -1,
+    .m_slots = PyPCAP_methods
 };
 
 
-static void PyPCAP_dealloc(PyPCAP_Object *self);
+static int  pypcap_init   (PyPCAP*, PyObject*, PyObject*);
+static void pypcap_dealloc(PyPCAP *self);
 
-static PyObject * pypcap_activate       (PyPCAP_Object *self);
-static PyObject * pypcap_close          (PyPCAP_Object *self);
-static PyObject * PyPCAP_stats          (PyPCAP_Object *self);
-static PyObject * pypcap_geterr         (PyPCAP_Object *self);
-static PyObject * pypcap_list_datalinks (PyPCAP_Object *self);
-static PyObject * pypcap_datalink       (PyPCAP_Object *self);
-static PyObject * pypcap_setnonblock    (PyPCAP_Object *self, PyObject *pyoBlocking);
-static PyObject * pypcap_getnonblock    (PyPCAP_Object *self);
-static PyObject * pypcap_setdirection   (PyPCAP_Object *self, PyObject *pyoDirection);
-static PyObject * pypcap_loop           (PyPCAP_Object *self, PyObject *pyoParams);
-static PyObject * pypcap_breakloop      (PyPCAP_Object *self);
-static PyObject * pypcap_next           (PyPCAP_Object *self);
-static PyObject * pypcap_fileno         (PyPCAP_Object *self);
-static PyObject * pypcap_inject         (PyPCAP_Object *self, PyObject *pyoPacket);
+static PyObject * pypcap_activate       (PyPCAP *self);
+static PyObject * pypcap_close          (PyPCAP *self);
+static PyObject * pypcap_stats          (PyPCAP *self);
+static PyObject * pypcap_geterr         (PyPCAP *self);
+static PyObject * pypcap_list_datalinks (PyPCAP *self);
+static PyObject * pypcap_datalink       (PyPCAP *self);
+static PyObject * pypcap_setnonblock    (PyPCAP *self, PyObject *pyoBlocking);
+static PyObject * pypcap_getnonblock    (PyPCAP *self);
+static PyObject * pypcap_setdirection   (PyPCAP *self, PyObject *pyoDirection);
+static PyObject * pypcap_loop           (PyPCAP *self, PyObject *pyoParams);
+static PyObject * pypcap_breakloop      (PyPCAP *self);
+static PyObject * pypcap_next           (PyPCAP *self);
+static PyObject * pypcap_fileno         (PyPCAP *self);
+static PyObject * pypcap_inject         (PyPCAP *self, PyObject *pyoPacket);
 #ifdef WIN32
-static PyObject * pypcap_getevent       (PyPCAP_Object *self);
+static PyObject * pypcap_getevent       (PyPCAP *self);
 #endif // WIN32
 
-static PyMethodDef PyPCAP_Object_methods[] = {
+static PyMethodDef PyPCAP_Type_methods[] = {
     { "activate",      (PyCFunction)pypcap_activate,       METH_NOARGS,  "activate an interface"              },
     { "close",         (PyCFunction)pypcap_close,          METH_NOARGS,  "close an interface"                 },
     { "stats",         (PyCFunction)pypcap_stats,          METH_NOARGS,  "get stats from a sessions"          },
@@ -91,34 +94,15 @@ static PyMethodDef PyPCAP_Object_methods[] = {
 };
 
 static PyTypeObject PyPCAP_Type = {
-    PyVarObject_HEAD_INIT(0, 0)
-    "pypcap",                        // name
-    sizeof(PyPCAP_Object),           // basicsize
-    0,                               // itemsize
-    (destructor)PyPCAP_dealloc,      // dealloc
-    0,                               // print
-    0,                               // getattr
-    0,                               // setattr
-    0,                               // compare
-    0,                               // repr
-    0,                               // as_number
-    0,                               // as_sequence
-    0,                               // as_mapping
-    0,                               // hash
-    0,                               // call
-    0,                               // str
-    0,                               // getattro
-    0,                               // setattro
-    0,                               // as_buffer
-    Py_TPFLAGS_DEFAULT,              // flags
-    "PyPCAP Class",                  // doc
-    0,                               // traverse
-    0,                               // clear
-    0,                               // richcompare
-    0,                               // weaklistoffset
-    0,                               // iter
-    0,                               // iternext
-    PyPCAP_Object_methods
+    PyVarObject_HEAD_INIT(NULL, 0)
+    .tp_name      = "pypcap",
+    .tp_doc       = "pypcap Class",
+    .tp_basicsize = sizeof(PyPCAP),
+    .tp_new       = PyType_GenericNew,
+    .tp_init      = (initproc)pypcap_init,
+    .tp_dealloc   = (destructor)pypcap_dealloc,
+    .tp_flags     = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE,
+    .tp_methods   = PyPCAP_Type_methods,
 };
 
 #ifdef WIN32
