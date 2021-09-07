@@ -1,34 +1,25 @@
-#ifdef WIN32
-// #include <Windows.h>
-#else // !WIN32
- #include <arpa/inet.h>
- #include <net/if.h>
-#ifdef MACOS
- #include <net/if_dl.h>
-#endif
- #include <netinet/in.h>
- #include <sys/ioctl.h>
- #include <sys/socket.h>
-// #include <sys/sysctl.h>
- #include <sys/types.h>
- #include <errno.h>
- #include <signal.h>
-#endif // WIN32
-
 #include "pypcap.h"
 
-#define CTXCHECK if(NULL == self->pd) { PyErr_SetString(PyExc_IOError, "No device opened"); return NULL; }
+#define CTXCHECK if(NULL == self->pd) { PyErr_SetString(pypcap_error, "no device opened"); return NULL; }
+
+
+PyObject *pypcap_error;
+
 
 PyMODINIT_FUNC PyInit_pypcap() {
     int ok;
 
-    ok = PyType_Ready(&PyPCAP_Type);
-    if(0 > ok) {
+    PyObject *mod = PyModule_Create(&PyPCAP_module);
+    if(NULL == mod) {
         return NULL;
     }
 
-    PyObject *mod = PyModule_Create(&PyPCAP_module);
-    if(NULL == mod) {
+    pypcap_error = PyErr_NewException("pypcap.error", NULL, NULL);
+    Py_INCREF(pypcap_error);
+    PyModule_AddObject(mod, "error", pypcap_error);
+
+    ok = PyType_Ready(&PyPCAP_Type);
+    if(0 > ok) {
         return NULL;
     }
 
@@ -42,13 +33,11 @@ PyMODINIT_FUNC PyInit_pypcap() {
     return mod;
 }
 
-/*
- *  PyPCAP Module Functions
- */
 
 static PyObject * pypcap_version(PyObject *self) {
     return PyUnicode_FromString(pcap_lib_version());
 }
+
 
 static PyObject * pypcap_find(PyObject *self) {
     PyObject *name;
@@ -60,19 +49,19 @@ static PyObject * pypcap_find(PyObject *self) {
     char canonical[MAX_PATH];
 #endif // WIN32
 
-    // Returns a linked list of all devices in the system
-    pcap_if_t *devices;
-    ok = pcap_findalldevs(&devices, errbuf);
+    // Returns a linked list of all interfaces in the system
+    pcap_if_t *interfaces;
+    ok = pcap_findalldevs(&interfaces, errbuf);
     if(0 > ok) {
-        PyErr_SetString(PyExc_IOError, errbuf);
+        PyErr_SetString(pypcap_error, errbuf);
         return NULL;
     }
 
     // Create empty dictionary
     PyObject *pyoDevDict = PyDict_New();
 
-    // Iterate through all devices
-    pcap_if_t *current = devices;
+    // Iterate through all interfaces
+    pcap_if_t *current = interfaces;
     while(current) {
         // Create an empty dictionary for all the addresses associated with an interface
         PyObject *dict = PyDict_New();
@@ -129,18 +118,19 @@ static PyObject * pypcap_find(PyObject *self) {
     }
 
     // Free the linked list
-    pcap_freealldevs(devices);
+    pcap_freealldevs(interfaces);
 
-    // Return the dictionary of devices
+    // Return the dictionary of interfaces
     return pyoDevDict;
 }
+
 
 static PyObject * pypcap_mac(PyObject *self, PyObject *interface) {
     int ok;
 
     ok = PyUnicode_Check(interface);
     if(FALSE == ok) {
-        PyErr_SetString(PyExc_TypeError, "Value must be a string");
+        PyErr_SetString(pypcap_error, "interface must be a string");
         return NULL;
     }
 
@@ -206,7 +196,7 @@ static PyObject * pypcap_mac(PyObject *self, PyObject *interface) {
     close(fd);
 
     if(0 > ok) {
-        PyErr_SetString(PyExc_IOError, "Error calling ioctl");
+        PyErr_SetString(pypcap_error, strerror(errno));
         return NULL;
     }
 
@@ -215,27 +205,24 @@ static PyObject * pypcap_mac(PyObject *self, PyObject *interface) {
 
 }
 
-static PyPCAP * pypcap_open_live(PyObject *self, PyObject *params) {
-    char *device = NULL;
+
+static PyPCAP * pypcap_open_live(PyObject *self, PyObject *arguments) {
+    char *inteface = NULL;
     int snaplen = DEFAULT_SNAPLEN;
     int promisc = DEFAULT_PROMISC;
     int to_ms   = DEFAULT_TO_MS;
     char errbuf[PCAP_ERRBUF_SIZE];
     int ok;
 
-#ifdef WIN32
-    char guid[MAX_PATH];
-#endif // WIN32
-
-    ok = PyArg_ParseTuple(params, "s|iii", &device, &snaplen, &promisc, &to_ms);
+    ok = PyArg_ParseTuple(arguments, "s|iii", &inteface, &snaplen, &promisc, &to_ms);
     if(FALSE == ok) {
-        PyErr_SetString(PyExc_TypeError, "");
         return NULL;
     }
 
 #ifdef WIN32
-    if(0 > get_guid(device, guid)) {
-        PyErr_SetString(PyExc_IOError, "Cannot find interface");
+    char guid[MAX_PATH];
+    if(0 > get_guid(inteface, guid)) {
+        PyErr_SetString(pypcap_error, "unknown interface");
         return NULL;
     }
 #endif // WIN32
@@ -248,10 +235,10 @@ static PyPCAP * pypcap_open_live(PyObject *self, PyObject *params) {
 #ifdef WIN32
     pypcap->pd = pcap_open_live(guid, snaplen, promisc, to_ms, errbuf);
 #else
-    pypcap->pd = pcap_open_live(device, snaplen, promisc, to_ms, errbuf);
+    pypcap->pd = pcap_open_live(inteface, snaplen, promisc, to_ms, errbuf);
 #endif
     if(NULL == pypcap->pd) {
-        PyErr_SetString(PyExc_IOError, errbuf);
+        PyErr_SetString(pypcap_error, errbuf);
         return NULL;
     }
 
@@ -262,13 +249,14 @@ static PyPCAP * pypcap_open_live(PyObject *self, PyObject *params) {
     return pypcap;
 }
 
-static PyPCAP * pypcap_open_file(PyObject *self, PyObject *pyoFilename) {
+
+static PyPCAP * pypcap_open_file(PyObject *self, PyObject *filename) {
     char errbuf[PCAP_ERRBUF_SIZE];
     int ok;
 
-    ok = PyUnicode_Check(pyoFilename);
+    ok = PyUnicode_Check(filename);
     if(FALSE == ok) {
-        PyErr_SetString(PyExc_TypeError, "Value must be a string");
+        PyErr_SetString(pypcap_error, "filename must be a string");
         return NULL;
     }
 
@@ -277,22 +265,23 @@ static PyPCAP * pypcap_open_file(PyObject *self, PyObject *pyoFilename) {
         return NULL;
     }
 
-    pypcap->pd = pcap_open_offline(PyUnicode_AsUTF8(pyoFilename), errbuf);
+    pypcap->pd = pcap_open_offline(PyUnicode_AsUTF8(filename), errbuf);
     if(NULL == pypcap->pd) {
-        PyErr_SetString(PyExc_IOError, errbuf);
+        PyErr_SetString(pypcap_error, errbuf);
         return NULL;
     }
 
     return pypcap;
 }
 
-static PyPCAP * pypcap_create(PyObject *self, PyObject *pyoDevice) {
+
+static PyPCAP * pypcap_create(PyObject *self, PyObject *interface) {
     char errbuf[PCAP_ERRBUF_SIZE];
     int ok;
 
-    ok = PyUnicode_Check(pyoDevice);
+    ok = PyUnicode_Check(interface);
     if(FALSE == ok) {
-        PyErr_SetString(PyExc_TypeError, "Value must be a string.");
+        PyErr_SetString(pypcap_error, "interface must be a string");
         return NULL;
     }
 
@@ -301,24 +290,21 @@ static PyPCAP * pypcap_create(PyObject *self, PyObject *pyoDevice) {
         return NULL;
     }
 
-    pypcap->pd = pcap_create(PyUnicode_AsUTF8(pyoDevice), errbuf);
+    pypcap->pd = pcap_create(PyUnicode_AsUTF8(interface), errbuf);
     if(NULL == pypcap->pd) {
-        PyErr_SetString(PyExc_IOError, errbuf);
+        PyErr_SetString(pypcap_error, errbuf);
         return NULL;
     }
 
     return pypcap;
 }
-
-/*
- *  PyPCAP Object Functions
- */
 
 
 static int pypcap_init(PyPCAP *self, PyObject *args, PyObject *kwds) {
     self->pd = NULL;
     return 0;
 }
+
 
 static void pypcap_dealloc(PyPCAP *self) {
     if(NULL != self->pd) {
@@ -328,11 +314,12 @@ static void pypcap_dealloc(PyPCAP *self) {
     PyObject_Del(self);
 }
 
+
 static PyObject * pypcap_activate(PyPCAP *self) {
     int ok;
     ok = pcap_activate(self->pd);
     if(0 > ok) {
-        PyErr_SetString(PyExc_IOError, pcap_statustostr(ok));
+        PyErr_SetString(pypcap_error, pcap_statustostr(ok));
         return NULL;
     }
     else if(0 < ok) {
@@ -342,6 +329,7 @@ static PyObject * pypcap_activate(PyPCAP *self) {
     Py_RETURN_NONE;
 }
 
+
 static PyObject * pypcap_close(PyPCAP *self) {
     if(NULL != self->pd) {
         pcap_close(self->pd);
@@ -350,22 +338,25 @@ static PyObject * pypcap_close(PyPCAP *self) {
     Py_RETURN_NONE;
 }
 
+
 static PyObject * pypcap_stats(PyPCAP *self) {
     struct pcap_stat ps;
 
     CTXCHECK
 
     if(-1 == pcap_stats(self->pd, &ps)) {
-        PyErr_SetString(PyExc_IOError, pcap_geterr(self->pd));
+        PyErr_SetString(pypcap_error, pcap_geterr(self->pd));
         return NULL;
     }
 
     return Py_BuildValue("III", ps.ps_recv, ps.ps_drop, ps.ps_ifdrop);
 }
 
+
 static PyObject * pypcap_geterr(PyPCAP *self) {
     return PyUnicode_FromString(pcap_geterr(self->pd));
 }
+
 
 static PyObject * pypcap_list_datalinks(PyPCAP *self) {
     int *dlts;
@@ -374,7 +365,7 @@ static PyObject * pypcap_list_datalinks(PyPCAP *self) {
 
     int len = pcap_list_datalinks(self->pd, &dlts);
     if(0 > len) {
-        PyErr_SetString(PyExc_IOError, pcap_geterr(self->pd));
+        PyErr_SetString(pypcap_error, pcap_geterr(self->pd));
         return NULL;
     }
 
@@ -393,33 +384,36 @@ static PyObject * pypcap_list_datalinks(PyPCAP *self) {
     return links;
 }
 
+
 static PyObject * pypcap_datalink(PyPCAP *self) {
     CTXCHECK
     int dlt = pcap_datalink(self->pd);
     return Py_BuildValue("iss", dlt, pcap_datalink_val_to_name(dlt), pcap_datalink_val_to_description(dlt));
 }
 
-static PyObject * pypcap_setnonblock(PyPCAP *self, PyObject *_blocking) {
+
+static PyObject * pypcap_setnonblock(PyPCAP *self, PyObject *blocking) {
     char errbuf[PCAP_ERRBUF_SIZE];
     int ok;
 
     CTXCHECK
 
-    ok = PyLong_Check(_blocking);
+    ok = PyLong_Check(blocking);
     if(FALSE == ok) {
-        PyErr_SetString(PyExc_TypeError, "Value must be a boolean or integer.");
+        PyErr_SetString(pypcap_error, "blocking must be boolean or integer");
         return NULL;
     }
 
-    long block = PyLong_AsLong(_blocking);
+    long block = PyLong_AsLong(blocking);
     ok = pcap_setnonblock(self->pd, block, errbuf);
     if(0 > ok) {
-        PyErr_SetString(PyExc_IOError, errbuf);
+        PyErr_SetString(pypcap_error, errbuf);
         return NULL;
     }
 
     Py_RETURN_NONE;
 }
+
 
 static PyObject * pypcap_getnonblock(PyPCAP *self) {
     char errbuf[PCAP_ERRBUF_SIZE];
@@ -428,14 +422,15 @@ static PyObject * pypcap_getnonblock(PyPCAP *self) {
 
     int block = pcap_getnonblock(self->pd, errbuf);
     if(0 > block) {
-        PyErr_SetString(PyExc_IOError, errbuf);
+        PyErr_SetString(pypcap_error, errbuf);
         return NULL;
     }
 
     return PyLong_FromLong(block);
 }
 
-static PyObject * pypcap_setdirection(PyPCAP *self, PyObject *_direction) {
+
+static PyObject * pypcap_setdirection(PyPCAP *self, PyObject *direction) {
 #ifdef WIN32
     Py_RETURN_FALSE;
 #else // !WIN32
@@ -443,18 +438,18 @@ static PyObject * pypcap_setdirection(PyPCAP *self, PyObject *_direction) {
 
     CTXCHECK
 
-    ok = PyLong_Check(_direction);
+    ok = PyLong_Check(direction);
     if(FALSE == ok) {
-        PyErr_SetString(PyExc_TypeError, "Value must be an integer.");
+        PyErr_SetString(pypcap_error, "direction must be an integer.");
         return NULL;
     }
 
-    long direction = PyLong_AsLong(_direction);
-    pcap_setdirection(self->pd, direction);
+    pcap_setdirection(self->pd, PyLong_AsLong(direction));
 
     Py_RETURN_TRUE;
 #endif // WIN32
 }
+
 
 static void pypcap_handler(u_char *user, const struct pcap_pkthdr *pkt_header, const u_char *pkt_data) {
     PyObject *retval = PyObject_CallFunction((PyObject *)user, "y#", pkt_data, pkt_header->caplen);
@@ -478,27 +473,27 @@ static void sig_handler(int signo) {
     }
 }
 
-static PyObject * pypcap_loop(PyPCAP *self, PyObject *params) {
+
+static PyObject * pypcap_loop(PyPCAP *self, PyObject *arguments) {
     PyObject *callback;
     int cnt = -1;
     int ok;
 
     CTXCHECK
 
-    ok = PyArg_ParseTuple(params, "O|i", &callback, &cnt);
+    ok = PyArg_ParseTuple(arguments, "O|i", &callback, &cnt);
     if(FALSE == ok) {
-        PyErr_SetString(PyExc_TypeError, "Bad args");
         return NULL;
     }
 
     ok = PyCallable_Check(callback);
     if(FALSE == ok) {
-        PyErr_SetString(PyExc_TypeError, "The callback needs to be a function");
+        PyErr_SetString(pypcap_error, "callback needs to be callable");
         return NULL;
     }
 
     if(NULL != _g_pd) {
-        PyErr_SetString(PyExc_IOError, "Only one pcap_loop can run at a time");
+        PyErr_SetString(pypcap_error, "only one pcap_loop can run at a time");
         return NULL;
     }
 
@@ -513,11 +508,13 @@ static PyObject * pypcap_loop(PyPCAP *self, PyObject *params) {
     Py_RETURN_NONE;
 }
 
+
 static PyObject * pypcap_breakloop(PyPCAP *self) {
     CTXCHECK
     pcap_breakloop(self->pd);
     Py_RETURN_NONE;
 }
+
 
 static PyObject * pypcap_next(PyPCAP *self) {
     struct pcap_pkthdr *hdr;
@@ -537,7 +534,7 @@ static PyObject * pypcap_next(PyPCAP *self) {
         // case 0 and -2 should be mutually exclusive, so None has the same meaning...
         Py_RETURN_NONE;
     case -1:
-        PyErr_SetString(PyExc_IOError, "Problem reading from pcap descriptor.");
+        PyErr_SetString(pypcap_error, "problem reading from pcap descriptor");
         return NULL;
     }
 
@@ -545,24 +542,26 @@ static PyObject * pypcap_next(PyPCAP *self) {
     return NULL;
 }
 
+
 static PyObject * pypcap_fileno(PyPCAP *self) {
     CTXCHECK
     return PyLong_FromLong(pcap_fileno(self->pd));
 }
 
-static PyObject * pypcap_inject(PyPCAP *self, PyObject *pyoPacket) {
+
+static PyObject * pypcap_inject(PyPCAP *self, PyObject *packet) {
     uint8_t *data;
     ssize_t len;
     int ok;
 
-    ok = PyBytes_AsStringAndSize(pyoPacket, (char **)&data, &len);
+    ok = PyBytes_AsStringAndSize(packet, (char **)&data, &len);
     if(0 > ok) {
         return NULL;
     }
 
     ok = pcap_inject(self->pd, data, len);
     if(0 > ok) {
-        PyErr_SetString(PyExc_IOError, pcap_geterr(self->pd));
+        PyErr_SetString(pypcap_error, pcap_geterr(self->pd));
         return NULL;
     }
 
@@ -570,6 +569,7 @@ static PyObject * pypcap_inject(PyPCAP *self, PyObject *pyoPacket) {
 }
 
 #ifdef WIN32
+
 static PyObject * pypcap_getevent(PyPCAP *self) {
     CTXCHECK
     return PyLong_FromLong(pcap_getevent(self->pd));
@@ -606,6 +606,7 @@ static int get_canonical(char *guid, char *name) {
 
     return hr != ERROR_SUCCESS ? -1 : 0;
 }
+
 
 static int get_guid(char *name, char *guid) {
     HKEY hkey_base;

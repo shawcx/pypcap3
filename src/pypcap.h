@@ -7,6 +7,20 @@
 #include <structmember.h>
 #include <pcap.h>
 
+#ifndef WIN32
+ #include <arpa/inet.h>
+ #include <net/if.h>
+#ifdef MACOS
+ #include <net/if_dl.h>
+#endif
+ #include <netinet/in.h>
+ #include <sys/ioctl.h>
+ #include <sys/socket.h>
+ #include <sys/types.h>
+ #include <errno.h>
+ #include <signal.h>
+#endif
+
 #define  DEFAULT_SNAPLEN  65535
 #define  DEFAULT_PROMISC  1
 #define  DEFAULT_TO_MS    100
@@ -26,11 +40,11 @@ typedef struct {
 
 static PyObject * pypcap_version   (PyObject * self);
 static PyObject * pypcap_find      (PyObject * self);
-static PyObject * pypcap_mac       (PyObject * self, PyObject * pyoInterface);
+static PyObject * pypcap_mac       (PyObject * self, PyObject * interface);
 
-static PyPCAP * pypcap_open_live (PyObject * self, PyObject * pyoParams);
-static PyPCAP * pypcap_open_file (PyObject * self, PyObject * pyoParams);
-static PyPCAP * pypcap_create    (PyObject * self, PyObject * pyoParams);
+static PyPCAP * pypcap_open_live (PyObject * self, PyObject * arguments);
+static PyPCAP * pypcap_open_file (PyObject * self, PyObject * filename);
+static PyPCAP * pypcap_create    (PyObject * self, PyObject * interface);
 
 static PyMethodDef PyPCAP_methods[] = {
     { "version",   (PyCFunction)pypcap_version,   METH_NOARGS,  "return the version"                },
@@ -60,14 +74,14 @@ static PyObject * pypcap_stats          (PyPCAP *self);
 static PyObject * pypcap_geterr         (PyPCAP *self);
 static PyObject * pypcap_list_datalinks (PyPCAP *self);
 static PyObject * pypcap_datalink       (PyPCAP *self);
-static PyObject * pypcap_setnonblock    (PyPCAP *self, PyObject *pyoBlocking);
+static PyObject * pypcap_setnonblock    (PyPCAP *self, PyObject *blocking);
 static PyObject * pypcap_getnonblock    (PyPCAP *self);
-static PyObject * pypcap_setdirection   (PyPCAP *self, PyObject *pyoDirection);
-static PyObject * pypcap_loop           (PyPCAP *self, PyObject *pyoParams);
+static PyObject * pypcap_setdirection   (PyPCAP *self, PyObject *direction);
+static PyObject * pypcap_loop           (PyPCAP *self, PyObject *arguments);
 static PyObject * pypcap_breakloop      (PyPCAP *self);
 static PyObject * pypcap_next           (PyPCAP *self);
 static PyObject * pypcap_fileno         (PyPCAP *self);
-static PyObject * pypcap_inject         (PyPCAP *self, PyObject *pyoPacket);
+static PyObject * pypcap_inject         (PyPCAP *self, PyObject *packet);
 #ifdef WIN32
 static PyObject * pypcap_getevent       (PyPCAP *self);
 #endif // WIN32
