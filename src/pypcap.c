@@ -316,8 +316,9 @@ static void pypcap_dealloc(PyPCAP *self) {
 
 
 static PyObject * pypcap_activate(PyPCAP *self) {
-    int ok;
-    ok = pcap_activate(self->pd);
+    CTXCHECK
+
+    int ok = pcap_activate(self->pd);
     if(0 > ok) {
         PyErr_SetString(pypcap_error, pcap_statustostr(ok));
         return NULL;
@@ -327,6 +328,17 @@ static PyObject * pypcap_activate(PyPCAP *self) {
 
     }
     Py_RETURN_NONE;
+}
+
+
+static PyObject * pypcap_snapshot(PyPCAP *self) {
+    CTXCHECK
+    int snaplen = pcap_snapshot(self->pd);
+    if(0 > snaplen) {
+        PyErr_SetString(pypcap_error, pcap_statustostr(snaplen));
+        return NULL;
+    }
+    return PyLong_FromLong(snaplen);
 }
 
 
@@ -392,6 +404,48 @@ static PyObject * pypcap_datalink(PyPCAP *self) {
 }
 
 
+static PyObject * pypcap_set_snaplen(PyPCAP *self, PyObject *snaplen) {
+    int ok;
+
+    CTXCHECK
+
+    ok = PyLong_Check(snaplen);
+    if(FALSE == ok) {
+        PyErr_SetString(pypcap_error, "snaplen must be an integer");
+        return NULL;
+    }
+
+    ok = pcap_set_snaplen(self->pd, PyLong_AsLong(snaplen));
+    if(0 > ok) {
+        PyErr_SetString(pypcap_error, pcap_statustostr(ok));
+        return NULL;
+    }
+
+    Py_RETURN_NONE;
+}
+
+
+static PyObject * pypcap_set_promisc(PyPCAP *self, PyObject *promisc) {
+    int ok;
+
+    CTXCHECK
+
+    ok = PyLong_Check(promisc);
+    if(FALSE == ok) {
+        PyErr_SetString(pypcap_error, "promisc must be boolean or integer");
+        return NULL;
+    }
+
+    ok = pcap_set_promisc(self->pd, PyLong_AsLong(promisc));
+    if(0 > ok) {
+        PyErr_SetString(pypcap_error, pcap_statustostr(ok));
+        return NULL;
+    }
+
+    Py_RETURN_NONE;
+}
+
+
 static PyObject * pypcap_setnonblock(PyPCAP *self, PyObject *blocking) {
     char errbuf[PCAP_ERRBUF_SIZE];
     int ok;
@@ -404,8 +458,7 @@ static PyObject * pypcap_setnonblock(PyPCAP *self, PyObject *blocking) {
         return NULL;
     }
 
-    long block = PyLong_AsLong(blocking);
-    ok = pcap_setnonblock(self->pd, block, errbuf);
+    ok = pcap_setnonblock(self->pd, PyLong_AsLong(blocking), errbuf);
     if(0 > ok) {
         PyErr_SetString(pypcap_error, errbuf);
         return NULL;

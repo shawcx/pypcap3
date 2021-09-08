@@ -69,11 +69,14 @@ static int  pypcap_init   (PyPCAP*, PyObject*, PyObject*);
 static void pypcap_dealloc(PyPCAP *self);
 
 static PyObject * pypcap_activate       (PyPCAP *self);
+static PyObject * pypcap_snapshot       (PyPCAP *self);
 static PyObject * pypcap_close          (PyPCAP *self);
 static PyObject * pypcap_stats          (PyPCAP *self);
 static PyObject * pypcap_geterr         (PyPCAP *self);
 static PyObject * pypcap_list_datalinks (PyPCAP *self);
 static PyObject * pypcap_datalink       (PyPCAP *self);
+static PyObject * pypcap_set_snaplen    (PyPCAP *self, PyObject *snaplen);
+static PyObject * pypcap_set_promisc    (PyPCAP *self, PyObject *promisc);
 static PyObject * pypcap_setnonblock    (PyPCAP *self, PyObject *blocking);
 static PyObject * pypcap_getnonblock    (PyPCAP *self);
 static PyObject * pypcap_setdirection   (PyPCAP *self, PyObject *direction);
@@ -88,11 +91,14 @@ static PyObject * pypcap_getevent       (PyPCAP *self);
 
 static PyMethodDef PyPCAP_Type_methods[] = {
     { "activate",      (PyCFunction)pypcap_activate,       METH_NOARGS,  "activate an interface"              },
+    { "snapshot",      (PyCFunction)pypcap_snapshot,       METH_NOARGS,  "get the snaplen"                    },
     { "close",         (PyCFunction)pypcap_close,          METH_NOARGS,  "close an interface"                 },
     { "stats",         (PyCFunction)pypcap_stats,          METH_NOARGS,  "get stats from a sessions"          },
     { "geterr",        (PyCFunction)pypcap_geterr,         METH_NOARGS,  "print the last error"               },
     { "list_datalinks",(PyCFunction)pypcap_list_datalinks, METH_NOARGS,  "return list of supported datalinks" },
     { "datalink",      (PyCFunction)pypcap_datalink,       METH_NOARGS,  "get datalink"                       },
+    { "setdirection",  (PyCFunction)pypcap_set_snaplen,    METH_O,       "set snaplen"                        },
+    { "setdirection",  (PyCFunction)pypcap_set_promisc,    METH_O,       "set promiscuous mode"               },
     { "setnonblock",   (PyCFunction)pypcap_setnonblock,    METH_O,       "set blocking or non-blocking"       },
     { "getnonblock",   (PyCFunction)pypcap_getnonblock,    METH_NOARGS,  "get blocking state"                 },
     { "setdirection",  (PyCFunction)pypcap_setdirection,   METH_O,       "set the direction of a capture"     },
