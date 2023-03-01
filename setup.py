@@ -24,11 +24,11 @@ source_files = glob.glob('./src/pypcap.c')
 
 setuptools.setup(
     name             = 'pypcap3',
-    author           = 'Matthew Oertle',
-    author_email     = 'moertle@gmail.com',
+    author           = 'Matthew Shaw',
+    author_email     = 'mshaw.cx@gmail.com',
     version          = '0.2',
     license          = 'MIT',
-    url              = 'https://github.com/moertle/pypcap3',
+    url              = 'https://github.com/shawcx/pypcap3',
     description      = 'Python 3 bindings for libpcap',
     long_description = open('README.rst').read(),
     ext_modules = [
