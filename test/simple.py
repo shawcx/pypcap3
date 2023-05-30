@@ -27,5 +27,7 @@ class Listener:
         self.count += 1
         print('%5d' % len(data), binascii.hexlify(data[:37]).decode('ascii'))
 
-
-Listener(sys.argv[1])
+try:
+    Listener(sys.argv[1])
+except pypcap.error as e:
+    print(e)
