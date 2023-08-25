@@ -33,7 +33,7 @@ setuptools.setup(
     long_description = open('README.rst').read(),
     ext_modules = [
         setuptools.Extension(
-            'pypcap',
+            'pypcap3',
             source_files,
             define_macros = defines,
             include_dirs  = include,

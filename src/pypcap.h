@@ -47,12 +47,13 @@ static PyPCAP * pypcap_open_file (PyObject * self, PyObject * filename);
 static PyPCAP * pypcap_create    (PyObject * self, PyObject * interface);
 
 static PyMethodDef PyPCAP_methods[] = {
-    { "version",   (PyCFunction)pypcap_version,   METH_NOARGS,  "return the version"                },
-    { "find",      (PyCFunction)pypcap_find,      METH_NOARGS,  "find suitable devices in a system" },
-    { "mac",       (PyCFunction)pypcap_mac,       METH_O,       "MAC address of an interface"       },
-    { "open_live", (PyCFunction)pypcap_open_live, METH_VARARGS, "open an interface"                 },
-    { "open_file", (PyCFunction)pypcap_open_file, METH_O,       "open a file"                       },
-    { "create",    (PyCFunction)pypcap_create,    METH_O,       "create a live capture handle"      },
+    { "version",      (PyCFunction)pypcap_version,   METH_NOARGS,  "return the version"                },
+    { "find",         (PyCFunction)pypcap_find,      METH_NOARGS,  "find suitable devices in a system" },
+    { "mac",          (PyCFunction)pypcap_mac,       METH_O,       "MAC address of an interface"       },
+    { "open_live",    (PyCFunction)pypcap_open_live, METH_VARARGS, "open an interface"                 },
+    { "open_file",    (PyCFunction)pypcap_open_file, METH_O,       "open a file"                       },
+    { "open_offline", (PyCFunction)pypcap_open_file, METH_O,       "open a file"                       },
+    { "create",       (PyCFunction)pypcap_create,    METH_O,       "create a live capture handle"      },
     { NULL }
 };
 

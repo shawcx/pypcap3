@@ -6,7 +6,7 @@
 PyObject *pypcap_error;
 
 
-PyMODINIT_FUNC PyInit_pypcap() {
+PyMODINIT_FUNC PyInit_pypcap3() {
     int ok;
 
     PyObject *mod = PyModule_Create(&PyPCAP_module);

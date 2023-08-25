@@ -3,10 +3,10 @@
 import sys
 import binascii
 
-import pypcap
+import pypcap3
 
 if len(sys.argv) == 1:
-    interfaces = pypcap.find()
+    interfaces = pypcap3.find()
     for interface,settings in interfaces.items():
         if 'ip' not in settings:
             continue
@@ -17,7 +17,7 @@ if len(sys.argv) == 1:
 class Listener:
     def __init__(self, interface):
         self.count = 0
-        pd = pypcap.open_live(interface)
+        pd = pypcap3.open_live(interface)
         pd.loop(self.onPacket)
         pd.close()
         print()
@@ -29,5 +29,5 @@ class Listener:
 
 try:
     Listener(sys.argv[1])
-except pypcap.error as e:
+except pypcap3.error as e:
     print(e)
