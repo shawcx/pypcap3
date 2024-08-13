@@ -1,3 +1,5 @@
 /build
 /dist
-/pypcap3.egg-info
+/deb_dist
+/*.egg-info
+/*.tar.gz
