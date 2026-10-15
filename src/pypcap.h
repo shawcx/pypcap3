@@ -12,6 +12,7 @@
  #include <net/if.h>
 #ifdef MACOS
  #include <net/if_dl.h>
+ #include <sys/sysctl.h>
 #endif
  #include <netinet/in.h>
  #include <sys/ioctl.h>
@@ -98,8 +99,8 @@ static PyMethodDef PyPCAP_Type_methods[] = {
     { "geterr",        (PyCFunction)pypcap_geterr,         METH_NOARGS,  "print the last error"               },
     { "list_datalinks",(PyCFunction)pypcap_list_datalinks, METH_NOARGS,  "return list of supported datalinks" },
     { "datalink",      (PyCFunction)pypcap_datalink,       METH_NOARGS,  "get datalink"                       },
-    { "setdirection",  (PyCFunction)pypcap_set_snaplen,    METH_O,       "set snaplen"                        },
-    { "setdirection",  (PyCFunction)pypcap_set_promisc,    METH_O,       "set promiscuous mode"               },
+    { "set_snaplen",   (PyCFunction)pypcap_set_snaplen,    METH_O,       "set snaplen"                        },
+    { "set_promisc",   (PyCFunction)pypcap_set_promisc,    METH_O,       "set promiscuous mode"               },
     { "setnonblock",   (PyCFunction)pypcap_setnonblock,    METH_O,       "set blocking or non-blocking"       },
     { "getnonblock",   (PyCFunction)pypcap_getnonblock,    METH_NOARGS,  "get blocking state"                 },
     { "setdirection",  (PyCFunction)pypcap_setdirection,   METH_O,       "set the direction of a capture"     },

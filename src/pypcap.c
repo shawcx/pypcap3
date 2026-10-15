@@ -177,9 +177,10 @@ static PyObject * pypcap_mac(PyObject *self, PyObject *interface) {
     sdl = (struct sockaddr_dl *)(ifm + 1);
     ptr = (uint8_t *)LLADDR(sdl);
 
+    PyObject *mac = PyBytes_FromStringAndSize((char *)ptr, 6);
     free(buff);
 
-    return PyBytes_FromStringAndSize((char *)ptr, 6);
+    return mac;
 #else // LINUX
     struct ifreq ifr;
 
