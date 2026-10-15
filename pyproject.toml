@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pypcap3"
+version = "0.2"
+description = "Python 3 bindings for libpcap"
+readme = "README.rst"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Matthew Shaw", email = "mshaw.cx@gmail.com" }]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: C",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Networking :: Monitoring",
+]
+
+[project.urls]
+Homepage = "https://github.com/shawcx/pypcap3"
+
+[tool.setuptools]
+# The only module is the C extension declared in setup.py; turn off package
+# auto-discovery so setuptools doesn't treat src/ as a src-layout package dir.
+packages = []

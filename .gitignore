@@ -3,3 +3,5 @@
 /deb_dist
 /*.egg-info
 /*.tar.gz
+/*.so
+/*.pyd

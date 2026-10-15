@@ -1,49 +1,30 @@
 #!/usr/bin/env python3
 
+# Project metadata lives in pyproject.toml; this file only describes the
+# C extension, whose macros and libraries depend on the build platform.
+
 import sys
-import os
-import platform
-import glob
 
 import setuptools
 
-if 'Windows' == platform.system():
+if sys.platform == 'win32':
     defines = [('WIN32',None), ('WPCAP',None)]
-    include = []
     libs    = ['wpcap', 'ws2_32', 'advapi32']
-elif 'Darwin' == platform.system():
+elif sys.platform == 'darwin':
     defines = [('MACOS',None)]
-    include = []
     libs    = ['pcap']
 else:
     defines = []
-    include = []
     libs    = ['pcap']
 
-source_files = glob.glob('./src/pypcap.c')
-
 setuptools.setup(
-    name             = 'pypcap3',
-    author           = 'Matthew Shaw',
-    author_email     = 'mshaw.cx@gmail.com',
-    version          = '0.2',
-    license          = 'MIT',
-    url              = 'https://github.com/shawcx/pypcap3',
-    description      = 'Python 3 bindings for libpcap',
-    long_description = open('README.rst').read(),
     ext_modules = [
         setuptools.Extension(
             'pypcap3',
-            source_files,
+            sources       = ['src/pypcap.c'],
+            depends       = ['src/pypcap.h'],
             define_macros = defines,
-            include_dirs  = include,
             libraries     = libs,
             )
-        ],
-    classifiers = [
-        'Development Status :: 3 - Alpha',
-        'Intended Audience :: Developers',
-        'License :: OSI Approved :: MIT License',
-        'Programming Language :: Python :: 3',
         ],
     )

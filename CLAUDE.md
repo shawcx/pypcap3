@@ -4,20 +4,28 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`pypcap3` is a single-file CPython C extension wrapping libpcap (Linux, macOS, Windows/WinPcap-Npcap). There is no Python package layer: `setup.py` compiles `src/pypcap.c` into the top-level extension module `pypcap3`.
+`pypcap3` is a single-file CPython C extension wrapping libpcap (Linux, macOS, Windows/WinPcap-Npcap). There is no Python package layer: the build compiles `src/pypcap.c` into the top-level extension module `pypcap3`.
+
+## Packaging
+
+- **`pyproject.toml`** holds all project metadata, including the version and the SPDX license (which is why it needs `setuptools>=77`). It also sets `packages = []`, because otherwise setuptools treats `src/` as a src-layout package directory and writes `egg-info` into it.
+- **`setup.py`** only declares the extension, because the `define_macros` and `libraries` depend on `sys.platform`. Declaring `src/pypcap.h` in `depends` makes header edits trigger a rebuild.
+- **`MANIFEST.in`** ships `src/*.c`, `src/*.h` and `README.rst` in the sdist, which the Debian package is built from (`deb_dist/` is the gitignored output).
 
 ## Build and run
 
 Needs libpcap headers (Linux: `libpcap-dev`; macOS: the SDK's libpcap; Windows: the WinPcap/Npcap SDK, linked as `wpcap`).
 
 ```sh
-python3 setup.py build_ext --inplace     # builds pypcap3.*.so in the repo root (not gitignored)
-pip install .                            # or install into the active environment
+pip install -e .                         # editable: builds pypcap3.*.so into the repo root (gitignored)
+pip wheel --no-deps -w dist .            # build a wheel
 PYTHONPATH=. python3 test/simple.py      # list interfaces that have an IPv4 address
 sudo PYTHONPATH=. python3 test/simple.py en0   # capture and hexdump packets until Ctrl-C
 ```
 
-There is no test suite or linter. `test/simple.py` is a manual smoke test, and live capture needs root (or BPF device access on macOS). Debian packages are built from the sdist; `MANIFEST.in` must keep shipping `src/` and `README.rst`, and `deb_dist/` is the gitignored output.
+Run `python -m build` from outside the repo root: there, the gitignored `build/` directory shadows the `build` package.
+
+After a C edit, rerun `pip install -e .` (or `python3 setup.py build_ext --inplace`) to rebuild. There is no test suite or linter. `test/simple.py` is a manual smoke test, and live capture needs root (or BPF device access on macOS).
 
 ## Architecture
 
