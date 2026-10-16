@@ -211,10 +211,10 @@ static PyObject * pypcap_find(PyObject *self) {
 }
 
 
-static PyObject * pypcap_mac(PyObject *self, PyObject *interface) {
+static PyObject * pypcap_mac(PyObject *self, PyObject *iface) {
     int ok;
 
-    ok = PyUnicode_Check(interface);
+    ok = PyUnicode_Check(iface);
     if(FALSE == ok) {
         PyErr_SetString(pypcap_error, "interface must be a string");
         return NULL;
@@ -235,7 +235,7 @@ static PyObject * pypcap_mac(PyObject *self, PyObject *interface) {
     mib[2] = 0;
     mib[3] = AF_LINK;
     mib[4] = NET_RT_IFLIST;
-    mib[5] = if_nametoindex(PyUnicode_AsUTF8(interface));
+    mib[5] = if_nametoindex(PyUnicode_AsUTF8(iface));
     if(mib[5] == 0) {
         //perror("if_nametoindex error");
         Py_RETURN_NONE;
@@ -269,7 +269,7 @@ static PyObject * pypcap_mac(PyObject *self, PyObject *interface) {
     struct ifreq ifr;
 
     ifr.ifr_addr.sa_family = AF_INET;
-    strncpy(ifr.ifr_name, PyUnicode_AsUTF8(interface), IFNAMSIZ-1);
+    strncpy(ifr.ifr_name, PyUnicode_AsUTF8(iface), IFNAMSIZ-1);
     ifr.ifr_name[IFNAMSIZ-1] = 0;
 
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
@@ -470,11 +470,11 @@ static PyPCAP * pypcap_open_file(PyObject *self, PyObject *arguments, PyObject *
 }
 
 
-static PyPCAP * pypcap_create(PyObject *self, PyObject *interface) {
+static PyPCAP * pypcap_create(PyObject *self, PyObject *iface) {
     char errbuf[PCAP_ERRBUF_SIZE];
     int ok;
 
-    ok = PyUnicode_Check(interface);
+    ok = PyUnicode_Check(iface);
     if(FALSE == ok) {
         PyErr_SetString(pypcap_error, "interface must be a string");
         return NULL;
@@ -485,7 +485,7 @@ static PyPCAP * pypcap_create(PyObject *self, PyObject *interface) {
         return NULL;
     }
 
-    pypcap->pd = pcap_create(PyUnicode_AsUTF8(interface), errbuf);
+    pypcap->pd = pcap_create(PyUnicode_AsUTF8(iface), errbuf);
     if(NULL == pypcap->pd) {
         PyErr_SetString(pypcap_error, errbuf);
         Py_DECREF(pypcap);
@@ -526,7 +526,7 @@ static PyPCAP * pypcap_open_dead(PyObject *self, PyObject *arguments, PyObject *
 }
 
 
-static PyObject * pypcap_lookupnet(PyObject *self, PyObject *interface) {
+static PyObject * pypcap_lookupnet(PyObject *self, PyObject *iface) {
     bpf_u_int32 net;
     bpf_u_int32 mask;
     struct in_addr addr;
@@ -535,13 +535,13 @@ static PyObject * pypcap_lookupnet(PyObject *self, PyObject *interface) {
     char errbuf[PCAP_ERRBUF_SIZE];
     int ok;
 
-    ok = PyUnicode_Check(interface);
+    ok = PyUnicode_Check(iface);
     if(FALSE == ok) {
         PyErr_SetString(pypcap_error, "interface must be a string");
         return NULL;
     }
 
-    const char *name = PyUnicode_AsUTF8(interface);
+    const char *name = PyUnicode_AsUTF8(iface);
     if(NULL == name) {
         return NULL;
     }

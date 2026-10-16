@@ -61,14 +61,14 @@ typedef struct {
 
 static PyObject * pypcap_version   (PyObject * self);
 static PyObject * pypcap_find      (PyObject * self);
-static PyObject * pypcap_mac       (PyObject * self, PyObject * interface);
+static PyObject * pypcap_mac       (PyObject * self, PyObject * iface);
 
 static PyPCAP * pypcap_open_live (PyObject * self, PyObject * arguments);
 static PyPCAP * pypcap_open_file (PyObject * self, PyObject * arguments, PyObject * keywords);
-static PyPCAP * pypcap_create    (PyObject * self, PyObject * interface);
+static PyPCAP * pypcap_create    (PyObject * self, PyObject * iface);
 static PyPCAP * pypcap_open_dead (PyObject * self, PyObject * arguments, PyObject * keywords);
 
-static PyObject * pypcap_lookupnet (PyObject * self, PyObject * interface);
+static PyObject * pypcap_lookupnet (PyObject * self, PyObject * iface);
 
 static PyObject * pypcap_datalink_name_to_val        (PyObject * self, PyObject * name);
 static PyObject * pypcap_datalink_val_to_name        (PyObject * self, PyObject * value);
