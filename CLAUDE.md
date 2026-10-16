@@ -25,16 +25,34 @@ sudo PYTHONPATH=. python3 test/simple.py en0   # capture and hexdump packets unt
 
 Run `python -m build` from outside the repo root: there, the gitignored `build/` directory shadows the `build` package.
 
-After a C edit, rerun `pip install -e .` (or `python3 setup.py build_ext --inplace`) to rebuild. There is no test suite or linter. `test/simple.py` is a manual smoke test, and live capture needs root (or BPF device access on macOS).
+After a C edit, rerun `pip install -e .` (or `python3 setup.py build_ext --inplace`) to rebuild. There is no linter. `test/simple.py` is a manual smoke test, and live capture needs root (or BPF device access on macOS).
+
+## Tests
+
+```sh
+pip install --group test                 # pytest, from [dependency-groups] in pyproject.toml
+PYTHONPATH=. pytest                      # whole suite, after building in place
+PYTHONPATH=. pytest -k loop              # tests matching a name
+```
+
+`test/test_pypcap3.py` needs no root or network. It writes small Ethernet captures with `pcap_bytes()` and reads them through `open_file`, and it uses unactivated `create('nosuch0')` handles for the live-capture error paths. Two tests rely on threads and signals:
+
+- **`test_sigint_interrupts_blocked_loop`** feeds a pipe through `/dev/fd/N`, then sends SIGINT while `loop()` is blocked on it. If `loop()` stops releasing the GIL, this test hangs.
+- **`test_loops_run_concurrently_in_threads`** uses a barrier, so it fails if two threads can't run loops at the same time.
+
+Opening a FIFO with `open_file` deadlocks such tests, because `open_file` holds the GIL while libpcap reads the header.
 
 ## Architecture
 
 - **`src/pypcap.h` holds the Python-facing surface:** every function prototype, both `PyMethodDef` tables (module-level and handle methods), the `PyModuleDef`, the `PyPCAP_Type` object, and the defaults (`DEFAULT_SNAPLEN`, `DEFAULT_PROMISC`, `DEFAULT_TO_MS`). `src/pypcap.c` holds only the implementations. Adding a method means adding a prototype and a table entry in the header plus the body in the `.c` file.
-- **Module functions** (`find`, `mac`, `version`, `open_live`, `open_file`/`open_offline`, `create`) are the only way to get a capture handle. `PyPCAP_Type` is not added to the module, so handles can't be constructed directly. Each handle wraps one `pcap_t *pd`, and handle methods start with the `CTXCHECK` macro, which raises if `pd` is NULL (for example after `close()`).
-- **Names:** the extension is `pypcap3` and its init function is `PyInit_pypcap3`. The `.m_name`, `tp_name`, and exception name still say `pypcap`. If you rename the module, the `PyInit_` symbol must match the `Extension` name in `setup.py`.
-- **Errors:** all failures raise the module's single exception, `pypcap3.error`, usually with libpcap's error buffer or `pcap_statustostr` text.
+- **Module functions** (`find`, `mac`, `version`, `open_live`, `open_file`/`open_offline`, `create`) are the only way to get a capture handle. `PyPCAP_Type` is not added to the module, so handles can't be constructed directly. Each handle wraps one `pcap_t *pd`. Handle methods start with the `CTXCHECK` macro, which raises if `pd` is NULL (for example after `close()`). Any new method that touches `pd` needs it too, or it crashes on a closed handle.
+- **Busy handles:** `loop()` and `next()` set `self->busy` while the GIL is released. The `BUSYCHECK` macro makes `close()`, `loop()` and `next()` raise while it is set, so the `pcap_t` can't be closed or re-entered from another thread or from inside the callback. `breakloop()` is deliberately not guarded.
+- **Names:** the extension, `.m_name` and exception are all `pypcap3`, and the init function is `PyInit_pypcap3`; only the handle's `tp_name` still says `pypcap`. If you rename the module, the `PyInit_` symbol must match the `Extension` name in `setup.py`.
+- **Errors:** all failures raise the module's single exception, `pypcap3.error`, usually with libpcap's error buffer or `pcap_statustostr` text. Every error path must set an exception before returning NULL; otherwise Python raises `SystemError`.
 - **Capture paths:**
-  - `loop(callback, cnt=-1)` runs `pcap_loop` holding the GIL. It allows one loop per process (the global `_g_pd`) and installs a temporary C `SIGINT` handler that calls `pcap_breakloop`, so Ctrl-C stops the loop. Exceptions raised in the callback are printed and swallowed, not propagated.
+  - `loop(callback, cnt=-1)` releases the GIL for `pcap_loop`. `pypcap_handler` takes the GIL back for each packet through the `loop_ctx` passed as libpcap's `user` pointer.
+  - In `loop()`, an exception from the callback, or a pending signal, calls `pcap_breakloop` and is raised from `loop()`. After `breakloop()`, `loop()` returns `None`.
+  - Ctrl-C: the first loop to start (`_g_pd` is NULL) installs a C SIGINT hook. The hook calls `pcap_breakloop` and then chains to the previous handler (Python's), so a blocked loop wakes up and `loop()` raises `KeyboardInterrupt`. Other loops running at the same time work, but can only be stopped with `breakloop()`.
   - `next()` releases the GIL around `pcap_next_ex`. It returns packet bytes only (no header or timestamp), or `None` on timeout or EOF.
 - **Platform splits** (`setup.py` defines `MACOS` on Darwin and `WIN32`/`WPCAP` on Windows):
   - `mac()` uses a `sysctl` `NET_RT_IFLIST` query on macOS, the `SIOCGIFHWADDR` ioctl on Linux, and returns `None` on Windows.

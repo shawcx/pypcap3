@@ -24,6 +24,12 @@ classifiers = [
 [project.urls]
 Homepage = "https://github.com/shawcx/pypcap3"
 
+[dependency-groups]
+test = ["pytest"]
+
+[tool.pytest.ini_options]
+testpaths = ["test"]
+
 [tool.setuptools]
 # The only module is the C extension declared in setup.py; turn off package
 # auto-discovery so setuptools doesn't treat src/ as a src-layout package dir.

@@ -6,6 +6,7 @@
 #include <Python.h>
 #include <structmember.h>
 #include <pcap.h>
+#include <signal.h>
 
 #ifndef WIN32
  #include <arpa/inet.h>
@@ -19,7 +20,6 @@
  #include <sys/socket.h>
  #include <sys/types.h>
  #include <errno.h>
- #include <signal.h>
 #endif
 
 #define  DEFAULT_SNAPLEN  65535
@@ -32,11 +32,12 @@
 #define FALSE 0
 #endif
 
-PyMODINIT_FUNC PyInit_pypcap(void);
+PyMODINIT_FUNC PyInit_pypcap3(void);
 
 typedef struct {
     PyObject_HEAD
     pcap_t *pd;
+    int busy;      // set while loop() or next() runs with the GIL released
 } PyPCAP;
 
 static PyObject * pypcap_version   (PyObject * self);
@@ -60,7 +61,7 @@ static PyMethodDef PyPCAP_methods[] = {
 
 static PyModuleDef PyPCAP_module = {
     PyModuleDef_HEAD_INIT,
-    .m_name    = "pypcap",
+    .m_name    = "pypcap3",
     .m_doc     = NULL,
     .m_size    = -1,
     .m_methods = PyPCAP_methods

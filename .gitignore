@@ -5,3 +5,5 @@
 /*.tar.gz
 /*.so
 /*.pyd
+__pycache__/
+/.pytest_cache

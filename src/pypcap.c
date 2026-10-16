@@ -1,12 +1,13 @@
 #include "pypcap.h"
 
 #define CTXCHECK if(NULL == self->pd) { PyErr_SetString(pypcap_error, "no device opened"); return NULL; }
+#define BUSYCHECK if(self->busy) { PyErr_SetString(pypcap_error, "handle is busy in loop() or next()"); return NULL; }
 
 
 PyObject *pypcap_error;
 
 
-PyMODINIT_FUNC PyInit_pypcap3() {
+PyMODINIT_FUNC PyInit_pypcap3(void) {
     int ok;
 
     PyObject *mod = PyModule_Create(&PyPCAP_module);
@@ -14,12 +15,13 @@ PyMODINIT_FUNC PyInit_pypcap3() {
         return NULL;
     }
 
-    pypcap_error = PyErr_NewException("pypcap.error", NULL, NULL);
+    pypcap_error = PyErr_NewException("pypcap3.error", NULL, NULL);
     Py_INCREF(pypcap_error);
     PyModule_AddObject(mod, "error", pypcap_error);
 
     ok = PyType_Ready(&PyPCAP_Type);
     if(0 > ok) {
+        Py_DECREF(mod);
         return NULL;
     }
 
@@ -71,6 +73,11 @@ static PyObject * pypcap_find(PyObject *self) {
         while(address) {
             struct sockaddr *sa = address->addr;
             struct sockaddr_in *sai;
+            if(NULL == sa) {
+                address = address->next;
+                continue;
+            }
+
             if(AF_INET == sa->sa_family) {
                 sai = (struct sockaddr_in *)address->addr;
                 if(NULL != sai) {
@@ -103,6 +110,7 @@ static PyObject * pypcap_find(PyObject *self) {
 
 #ifdef WIN32
         if(0 > get_canonical(current->name + 12, canonical)) {
+            Py_DECREF(dict);
             current = current->next;
             continue;
         }
@@ -134,11 +142,9 @@ static PyObject * pypcap_mac(PyObject *self, PyObject *interface) {
         return NULL;
     }
 
-#ifdef WIN32
+#if defined(WIN32)
     Py_RETURN_NONE;
-#endif // WIN32
-
-#ifdef MACOS
+#elif defined(MACOS)
     int mib[6];
     size_t len;
     char *buff;
@@ -190,6 +196,7 @@ static PyObject * pypcap_mac(PyObject *self, PyObject *interface) {
 
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
     if(0 > fd) {
+        PyErr_SetString(pypcap_error, strerror(errno));
         return NULL;
     }
 
@@ -203,7 +210,6 @@ static PyObject * pypcap_mac(PyObject *self, PyObject *interface) {
 
     return PyBytes_FromStringAndSize((char *)ifr.ifr_hwaddr.sa_data, 6);
 #endif // LINUX
-
 }
 
 
@@ -240,6 +246,7 @@ static PyPCAP * pypcap_open_live(PyObject *self, PyObject *arguments) {
 #endif
     if(NULL == pypcap->pd) {
         PyErr_SetString(pypcap_error, errbuf);
+        Py_DECREF(pypcap);
         return NULL;
     }
 
@@ -269,6 +276,7 @@ static PyPCAP * pypcap_open_file(PyObject *self, PyObject *filename) {
     pypcap->pd = pcap_open_offline(PyUnicode_AsUTF8(filename), errbuf);
     if(NULL == pypcap->pd) {
         PyErr_SetString(pypcap_error, errbuf);
+        Py_DECREF(pypcap);
         return NULL;
     }
 
@@ -294,6 +302,7 @@ static PyPCAP * pypcap_create(PyObject *self, PyObject *interface) {
     pypcap->pd = pcap_create(PyUnicode_AsUTF8(interface), errbuf);
     if(NULL == pypcap->pd) {
         PyErr_SetString(pypcap_error, errbuf);
+        Py_DECREF(pypcap);
         return NULL;
     }
 
@@ -302,7 +311,8 @@ static PyPCAP * pypcap_create(PyObject *self, PyObject *interface) {
 
 
 static int pypcap_init(PyPCAP *self, PyObject *args, PyObject *kwds) {
-    self->pd = NULL;
+    self->pd   = NULL;
+    self->busy = 0;
     return 0;
 }
 
@@ -312,7 +322,7 @@ static void pypcap_dealloc(PyPCAP *self) {
         pcap_close(self->pd);
         self->pd = NULL;
     }
-    PyObject_Del(self);
+    Py_TYPE(self)->tp_free((PyObject *)self);
 }
 
 
@@ -344,6 +354,7 @@ static PyObject * pypcap_snapshot(PyPCAP *self) {
 
 
 static PyObject * pypcap_close(PyPCAP *self) {
+    BUSYCHECK
     if(NULL != self->pd) {
         pcap_close(self->pd);
         self->pd = NULL;
@@ -367,7 +378,14 @@ static PyObject * pypcap_stats(PyPCAP *self) {
 
 
 static PyObject * pypcap_geterr(PyPCAP *self) {
+    CTXCHECK
     return PyUnicode_FromString(pcap_geterr(self->pd));
+}
+
+
+// (dlt, name, description); libpcap returns NULL names for DLTs it doesn't know, which become None
+static PyObject * datalink_tuple(int dlt) {
+    return Py_BuildValue("izz", dlt, pcap_datalink_val_to_name(dlt), pcap_datalink_val_to_description(dlt));
 }
 
 
@@ -383,12 +401,18 @@ static PyObject * pypcap_list_datalinks(PyPCAP *self) {
     }
 
     PyObject *links = PyList_New(len);
+    if(NULL == links) {
+        pcap_free_datalinks(dlts);
+        return NULL;
+    }
 
     for(int idx = 0; idx < len; ++idx) {
-        PyObject *value = PyTuple_New(3);
-        PyTuple_SET_ITEM(value, 0, PyLong_FromLong(dlts[idx]));
-        PyTuple_SET_ITEM(value, 1, PyUnicode_FromString(pcap_datalink_val_to_name(dlts[idx])));
-        PyTuple_SET_ITEM(value, 2, PyUnicode_FromString(pcap_datalink_val_to_description(dlts[idx])));
+        PyObject *value = datalink_tuple(dlts[idx]);
+        if(NULL == value) {
+            Py_DECREF(links);
+            pcap_free_datalinks(dlts);
+            return NULL;
+        }
         PyList_SET_ITEM(links, idx, value);
     }
 
@@ -401,7 +425,11 @@ static PyObject * pypcap_list_datalinks(PyPCAP *self) {
 static PyObject * pypcap_datalink(PyPCAP *self) {
     CTXCHECK
     int dlt = pcap_datalink(self->pd);
-    return Py_BuildValue("iss", dlt, pcap_datalink_val_to_name(dlt), pcap_datalink_val_to_description(dlt));
+    if(0 > dlt) {
+        PyErr_SetString(pypcap_error, pcap_statustostr(dlt));
+        return NULL;
+    }
+    return datalink_tuple(dlt);
 }
 
 
@@ -498,34 +526,100 @@ static PyObject * pypcap_setdirection(PyPCAP *self, PyObject *direction) {
         return NULL;
     }
 
-    pcap_setdirection(self->pd, PyLong_AsLong(direction));
+    ok = pcap_setdirection(self->pd, PyLong_AsLong(direction));
+    if(0 > ok) {
+        PyErr_SetString(pypcap_error, pcap_geterr(self->pd));
+        return NULL;
+    }
 
     Py_RETURN_TRUE;
 #endif // WIN32
 }
 
 
+//
+// pypcap_loop runs pcap_loop with the GIL released; the handler takes it back
+// for each packet. An exception from the callback, or a pending signal such
+// as Ctrl-C, stops the loop and is raised from loop().
+//
+typedef struct {
+    PyObject      *callback;
+    pcap_t        *pd;
+    PyThreadState *tstate;
+    int            failed;
+} loop_ctx;
+
 static void pypcap_handler(u_char *user, const struct pcap_pkthdr *pkt_header, const u_char *pkt_data) {
-    PyObject *retval = PyObject_CallFunction((PyObject *)user, "y#", pkt_data, pkt_header->caplen);
-    if(retval) {
-        Py_DECREF(retval);
-    } else {
-        PyErr_Print();
-        PyErr_Clear();
+    loop_ctx *ctx = (loop_ctx *)user;
+
+    // libpcap may still deliver the rest of the current buffer after pcap_breakloop
+    if(ctx->failed) {
+        return;
     }
+
+    PyEval_RestoreThread(ctx->tstate);
+
+    PyObject *retval = PyObject_CallFunction(ctx->callback, "y#", pkt_data, (Py_ssize_t)pkt_header->caplen);
+    Py_XDECREF(retval);
+    if(NULL == retval || 0 > PyErr_CheckSignals()) {
+        ctx->failed = 1;
+        pcap_breakloop(ctx->pd);
+    }
+
+    ctx->tstate = PyEval_SaveThread();
 }
 
 //
-// Used by pypcap_loop to break immediately on Ctrl-C
+// SIGINT hook so Ctrl-C breaks a loop that is blocked waiting for packets.
+// It calls pcap_breakloop and then chains to the previous handler (normally
+// Python's), so loop() can raise KeyboardInterrupt. Only one loop at a time
+// holds the hook; loops started while it is taken can be stopped with breakloop().
 //
+static pcap_t * volatile _g_pd = NULL;
+
+#ifdef WIN32
 typedef void (*sigfunc)(int);
-static pcap_t *_g_pd = NULL;
+static sigfunc _g_prev_handler;
 
 static void sig_handler(int signo) {
-    if(signo == SIGINT) {
+    if(NULL != _g_pd) {
         pcap_breakloop(_g_pd);
     }
+    if(SIG_DFL != _g_prev_handler && SIG_IGN != _g_prev_handler && SIG_ERR != _g_prev_handler) {
+        _g_prev_handler(signo);
+    }
 }
+
+static void hook_sigint(void)   { _g_prev_handler = signal(SIGINT, sig_handler); }
+static void unhook_sigint(void) { signal(SIGINT, _g_prev_handler); }
+#else // !WIN32
+static struct sigaction _g_prev_action;
+
+static void sig_handler(int signo, siginfo_t *info, void *context) {
+    if(NULL != _g_pd) {
+        pcap_breakloop(_g_pd);
+    }
+    if(_g_prev_action.sa_flags & SA_SIGINFO) {
+        _g_prev_action.sa_sigaction(signo, info, context);
+    }
+    else if(SIG_DFL != _g_prev_action.sa_handler && SIG_IGN != _g_prev_action.sa_handler) {
+        _g_prev_action.sa_handler(signo);
+    }
+}
+
+static void hook_sigint(void) {
+    struct sigaction action;
+    memset(&action, 0, sizeof(action));
+    action.sa_sigaction = sig_handler;
+    action.sa_flags     = SA_SIGINFO;
+    sigemptyset(&action.sa_mask);
+    sigaction(SIGINT, &action, &_g_prev_action);
+}
+
+static void unhook_sigint(void) {
+    sigaction(SIGINT, &_g_prev_action, NULL);
+}
+#endif // WIN32
 
 
 static PyObject * pypcap_loop(PyPCAP *self, PyObject *arguments) {
@@ -534,6 +628,7 @@ static PyObject * pypcap_loop(PyPCAP *self, PyObject *arguments) {
     int ok;
 
     CTXCHECK
+    BUSYCHECK
 
     ok = PyArg_ParseTuple(arguments, "O|i", &callback, &cnt);
     if(FALSE == ok) {
@@ -546,18 +641,47 @@ static PyObject * pypcap_loop(PyPCAP *self, PyObject *arguments) {
         return NULL;
     }
 
-    if(NULL != _g_pd) {
-        PyErr_SetString(pypcap_error, "only one pcap_loop can run at a time");
+    loop_ctx ctx = { callback, self->pd, NULL, 0 };
+
+    int hooked = (NULL == _g_pd);
+    if(hooked) {
+        _g_pd = self->pd;
+        hook_sigint();
+    }
+
+    self->busy = 1;
+    ctx.tstate = PyEval_SaveThread();
+    ok = pcap_loop(self->pd, cnt, pypcap_handler, (u_char *)&ctx);
+    PyEval_RestoreThread(ctx.tstate);
+    self->busy = 0;
+
+    if(hooked) {
+        unhook_sigint();
+        _g_pd = NULL;
+    }
+
+    if(ctx.failed) {
+        // the callback raised, or a signal handler did
         return NULL;
     }
 
-    _g_pd = self->pd;
-    // install temporary signal handler
-    sigfunc _pyhandler;
-    _pyhandler = signal(SIGINT, sig_handler);
-    ok = pcap_loop(self->pd, cnt, pypcap_handler, (u_char *)callback);
-    signal(SIGINT, _pyhandler);
-    _g_pd = NULL;
+    // Ctrl-C ends the loop with PCAP_ERROR_BREAK, or with PCAP_ERROR when it
+    // interrupts a blocking read; either way, raise KeyboardInterrupt instead
+    if(0 > ok && 0 > PyErr_CheckSignals()) {
+        return NULL;
+    }
+
+    switch(ok) {
+    case 0:
+    case PCAP_ERROR_BREAK:
+        break;
+    case PCAP_ERROR:
+        PyErr_SetString(pypcap_error, pcap_geterr(self->pd));
+        return NULL;
+    default:
+        PyErr_SetString(pypcap_error, pcap_statustostr(ok));
+        return NULL;
+    }
 
     Py_RETURN_NONE;
 }
@@ -575,25 +699,30 @@ static PyObject * pypcap_next(PyPCAP *self) {
     const u_char *data;
     int ok;
 
+    CTXCHECK
+    BUSYCHECK
+
+    self->busy = 1;
     Py_BEGIN_ALLOW_THREADS
         ok = pcap_next_ex(self->pd, &hdr, &data);
     Py_END_ALLOW_THREADS
+    self->busy = 0;
 
     switch(ok) {
     case 1:
         // TODO: do something more with the header...
         return PyBytes_FromStringAndSize((const char *)data, hdr->caplen);
     case 0:
-    case -2:
-        // case 0 and -2 should be mutually exclusive, so None has the same meaning...
+    case PCAP_ERROR_BREAK:
+        // timeout on a live capture, or end of a file: both mean no packet
         Py_RETURN_NONE;
-    case -1:
-        PyErr_SetString(pypcap_error, "problem reading from pcap descriptor");
+    case PCAP_ERROR:
+        PyErr_SetString(pypcap_error, pcap_geterr(self->pd));
+        return NULL;
+    default:
+        PyErr_SetString(pypcap_error, pcap_statustostr(ok));
         return NULL;
     }
-
-    // Should never be reached...
-    return NULL;
 }
 
 
@@ -605,8 +734,10 @@ static PyObject * pypcap_fileno(PyPCAP *self) {
 
 static PyObject * pypcap_inject(PyPCAP *self, PyObject *packet) {
     uint8_t *data;
-    ssize_t len;
+    Py_ssize_t len;
     int ok;
+
+    CTXCHECK
 
     ok = PyBytes_AsStringAndSize(packet, (char **)&data, &len);
     if(0 > ok) {
