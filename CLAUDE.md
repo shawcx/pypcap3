@@ -14,7 +14,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Build and run
 
-Needs libpcap headers (Linux: `libpcap-dev`; macOS: the SDK's libpcap; Windows: the WinPcap/Npcap SDK, linked as `wpcap`).
+Needs libpcap headers (Linux: `libpcap-dev`; macOS: the SDK's libpcap; Windows: the Npcap SDK, linked as `wpcap`). On Windows, set `NPCAP_SDK` to the unpacked SDK, and `setup.py` adds its `Include` and `Lib/<arch>` directories. Requires Python 3.9 or later.
 
 ```sh
 pip install -e .                         # editable: builds pypcap3.*.so into the repo root (gitignored)
@@ -40,6 +40,8 @@ PYTHONPATH=. pytest -k loop              # tests matching a name
 - It builds frames with `ether()` and `ipv4_udp()`, writes them as captures with `pcap_bytes()`, and reads them through `open_file`.
 - It checks written files byte for byte with `read_pcap()`, a small parser that also reads microsecond and nanosecond files.
 - It uses unactivated `create('nosuch0')` handles for the live-capture error paths.
+
+`.github/workflows/ci.yml` runs the suite on Ubuntu and macOS with Python 3.9 and 3.14. On Windows it only builds a wheel against the Npcap SDK (`NPCAP_SDK_VERSION`), because running the tests needs the Npcap driver, and its free installer can't run unattended. All of the Windows-only C code is therefore compiled in CI but never run.
 
 Two tests rely on threads and signals:
 
@@ -70,7 +72,12 @@ Two tests rely on threads and signals:
   - `dump_open()` returns a dumper whose file header takes the handle's link type and snaplen.
   - `write()` truncates data to that snaplen but records the full length, and timestamps default to now.
   - `loop(dumper)` uses `dump_handler`, which counts each packet and calls `pcap_dump`, with no Python call per packet, so packets keep their capture timestamps. `loop(dumper.write, header=True)` gives the same file, because `write()` takes `(packet, ts, orig_len)`.
+  - `dumper.tell()` (`pcap_dump_ftell64`) includes the 24-byte file header and fails on pipes.
   - The dumper's own `busy` flag stops `write()` and `close()` during that loop, because `pcap_dump` makes two separate `fwrite`s per packet that could interleave.
+- **Link types and file details:**
+  - `set_datalink()` switches to another entry of `list_datalinks()`. Handles that can't switch accept their current link type and reject others.
+  - Module-level `datalink_name_to_val`, `datalink_val_to_name`, `datalink_val_to_description`, `tstamp_type_name_to_val` and `tstamp_type_val_to_name` convert between names and numbers. Names have no `DLT_` prefix and match case-insensitively; unknown numbers give `None`.
+  - `major_version()`, `minor_version()` and `is_swapped()` go through `file_property()`. They only mean something for capture files.
 - **Names:** the extension, `.m_name` and exception are all `pypcap3`, and the init function is `PyInit_pypcap3`; only the handle's `tp_name` still says `pypcap`. If you rename the module, the `PyInit_` symbol must match the `Extension` name in `setup.py`.
 - **Errors:** all failures raise the module's single exception, `pypcap3.error`, usually with libpcap's error buffer or `pcap_statustostr` text. Every error path must set an exception before returning NULL; otherwise Python raises `SystemError`.
 - **Capture paths:**

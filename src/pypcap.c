@@ -571,6 +571,101 @@ static PyObject * pypcap_lookupnet(PyObject *self, PyObject *interface) {
 }
 
 
+//
+// Name <-> number lookups for link types and timestamp sources
+//
+
+static int int_argument(PyObject *value, const char *what, int *number) {
+    if(!PyLong_Check(value)) {
+        PyErr_Format(pypcap_error, "%s must be an integer", what);
+        return -1;
+    }
+    long result = PyLong_AsLong(value);
+    if(-1 == result && PyErr_Occurred()) {
+        return -1;
+    }
+    *number = (int)result;
+    return 0;
+}
+
+
+static const char * str_argument(PyObject *value, const char *what) {
+    if(!PyUnicode_Check(value)) {
+        PyErr_Format(pypcap_error, "%s must be a string", what);
+        return NULL;
+    }
+    return PyUnicode_AsUTF8(value);
+}
+
+
+static PyObject * str_or_none(const char *text) {
+    if(NULL == text) {
+        Py_RETURN_NONE;
+    }
+    return PyUnicode_FromString(text);
+}
+
+
+static PyObject * pypcap_datalink_name_to_val(PyObject *self, PyObject *name) {
+    const char *text = str_argument(name, "name");
+    if(NULL == text) {
+        return NULL;
+    }
+
+    // names as in datalink(), case-insensitive, without the DLT_ prefix
+    int value = pcap_datalink_name_to_val(text);
+    if(0 > value) {
+        PyErr_Format(pypcap_error, "unknown link type '%s'", text);
+        return NULL;
+    }
+
+    return PyLong_FromLong(value);
+}
+
+
+static PyObject * pypcap_datalink_val_to_name(PyObject *self, PyObject *value) {
+    int number;
+    if(0 > int_argument(value, "link type", &number)) {
+        return NULL;
+    }
+    return str_or_none(pcap_datalink_val_to_name(number));
+}
+
+
+static PyObject * pypcap_datalink_val_to_description(PyObject *self, PyObject *value) {
+    int number;
+    if(0 > int_argument(value, "link type", &number)) {
+        return NULL;
+    }
+    return str_or_none(pcap_datalink_val_to_description(number));
+}
+
+
+static PyObject * pypcap_tstamp_type_name_to_val(PyObject *self, PyObject *name) {
+    const char *text = str_argument(name, "name");
+    if(NULL == text) {
+        return NULL;
+    }
+
+    int value = pcap_tstamp_type_name_to_val(text);
+    if(0 > value) {
+        PyErr_Format(pypcap_error, "unknown timestamp type '%s'", text);
+        return NULL;
+    }
+
+    return PyLong_FromLong(value);
+}
+
+
+static PyObject * pypcap_tstamp_type_val_to_name(PyObject *self, PyObject *value) {
+    int number;
+    if(0 > int_argument(value, "timestamp type", &number)) {
+        return NULL;
+    }
+    return str_or_none(pcap_tstamp_type_val_to_name(number));
+}
+
+
 static int pypcap_init(PyPCAP *self, PyObject *args, PyObject *kwds) {
     self->pd   = NULL;
     self->busy = 0;
@@ -692,6 +787,54 @@ static PyObject * pypcap_datalink(PyPCAP *self) {
         return NULL;
     }
     return datalink_tuple(dlt);
+}
+
+
+static PyObject * pypcap_set_datalink(PyPCAP *self, PyObject *value) {
+    int dlt;
+
+    CTXCHECK
+
+    if(0 > int_argument(value, "link type", &dlt)) {
+        return NULL;
+    }
+
+    if(0 > pcap_set_datalink(self->pd, dlt)) {
+        PyErr_SetString(pypcap_error, pcap_geterr(self->pd));
+        return NULL;
+    }
+
+    Py_RETURN_NONE;
+}
+
+
+// pcap_major_version() and friends describe a capture file; on a live handle
+// libpcap returns values that mean nothing, or an error if it isn't activated
+static PyObject * file_property(PyPCAP *self, int (*getter)(pcap_t *), int as_bool) {
+    CTXCHECK
+
+    int value = getter(self->pd);
+    if(0 > value) {
+        PyErr_SetString(pypcap_error, pcap_statustostr(value));
+        return NULL;
+    }
+
+    return as_bool ? PyBool_FromLong(value) : PyLong_FromLong(value);
+}
+
+
+static PyObject * pypcap_major_version(PyPCAP *self) {
+    return file_property(self, pcap_major_version, 0);
+}
+
+
+static PyObject * pypcap_minor_version(PyPCAP *self) {
+    return file_property(self, pcap_minor_version, 0);
+}
+
+
+static PyObject * pypcap_is_swapped(PyPCAP *self) {
+    return file_property(self, pcap_is_swapped, 1);
 }
 
 
@@ -1568,6 +1711,21 @@ static PyObject * pypcap_dumper_flush(PyDumper *self) {
 }
 
 
+// where the next packet goes, so a caller can start a new file at some size;
+// fails on a pipe
+static PyObject * pypcap_dumper_tell(PyDumper *self) {
+    DUMPCHECK
+
+    int64_t position = pcap_dump_ftell64(self->dumper);
+    if(0 > position) {
+        PyErr_SetString(pypcap_error, strerror(errno));
+        return NULL;
+    }
+
+    return PyLong_FromLongLong(position);
+}
+
+
 static PyObject * pypcap_dumper_close(PyDumper *self) {
     DUMPBUSYCHECK
 
@@ -1605,7 +1763,8 @@ static PyObject * pypcap_dumper_exit(PyDumper *self, PyObject *arguments) {
 
 static PyObject * pypcap_getevent(PyPCAP *self) {
     CTXCHECK
-    return PyLong_FromLong(pcap_getevent(self->pd));
+    // a HANDLE is a pointer, too wide for a long on 64-bit Windows
+    return PyLong_FromVoidPtr(pcap_getevent(self->pd));
 }
 
 // Code that allows you to open a device by the name (e.g. Local Area Connection) instead of a GUID on Windows
@@ -1686,7 +1845,7 @@ static int get_guid(char *name, char *guid) {
 
         RegCloseKey(hkey_connection);
 
-        if(!stricmp(cannon, name)) {
+        if(!_stricmp(cannon, name)) {
             snprintf(uid, MAX_PATH, "\\Device\\NPF_%s", guid);
             strcpy(guid, uid);
             RegCloseKey(hkey_base);

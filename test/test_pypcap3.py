@@ -19,11 +19,11 @@ LINKTYPE_ETHERNET = 1
 DLT_RAW = 12
 
 
-def pcap_bytes(packets, linktype=LINKTYPE_ETHERNET, snaplen=65535):
-    """A classic little-endian pcap file holding the given frames."""
-    out = [struct.pack('<IHHiIII', 0xa1b2c3d4, 2, 4, 0, 0, snaplen, linktype)]
+def pcap_bytes(packets, linktype=LINKTYPE_ETHERNET, snaplen=65535, endian='<'):
+    """A classic pcap file holding the given frames, little-endian unless endian='>'."""
+    out = [struct.pack(endian + 'IHHiIII', 0xa1b2c3d4, 2, 4, 0, 0, snaplen, linktype)]
     for idx, pkt in enumerate(packets):
-        out.append(struct.pack('<IIII', 1700000000 + idx, idx * 1000 + 7, len(pkt), len(pkt)))
+        out.append(struct.pack(endian + 'IIII', 1700000000 + idx, idx * 1000 + 7, len(pkt), len(pkt)))
         out.append(pkt)
     return b''.join(out)
 
@@ -332,6 +332,10 @@ def test_handle_busy_inside_loop(handle, call):
     ('can_set_rfmon', ()),
     ('list_tstamp_types', ()),
     ('get_tstamp_precision', ()),
+    ('set_datalink', (1,)),
+    ('major_version', ()),
+    ('minor_version', ()),
+    ('is_swapped', ()),
 ] + ([] if sys.platform == 'win32' else [
     ('get_selectable_fd', ()),
     ('get_required_select_timeout', ()),
@@ -594,7 +598,7 @@ def test_dumper_closed(tmp_path):
     with pypcap3.open_dead().dump_open(tmp_path / 'closed.pcap') as dumper:
         dumper.flush()
     dumper.close()
-    for call in (lambda: dumper.write(b'\x00'), dumper.flush, lambda: dumper.__enter__()):
+    for call in (lambda: dumper.write(b'\x00'), dumper.flush, dumper.tell, lambda: dumper.__enter__()):
         with pytest.raises(pypcap3.error, match='dumper is closed'):
             call()
 
@@ -1013,3 +1017,81 @@ def test_instructions():
     assert lines[0] == '(000) ldh      [12]'
     assert lines[-1].startswith(f'({len(lines) - 1:03d}) ret ')
     assert pypcap3.open_dead().compile('').instructions() == ['(000) ret      #65535']
+
+
+# link types, timestamp names and file details
+
+
+def test_datalink_lookups():
+    assert pypcap3.datalink_name_to_val('EN10MB') == 1
+    assert pypcap3.datalink_name_to_val('en10mb') == 1
+    assert pypcap3.datalink_name_to_val('RAW') == DLT_RAW
+    assert pypcap3.datalink_val_to_name(1) == 'EN10MB'
+    assert pypcap3.datalink_val_to_description(1) == 'Ethernet'
+    assert pypcap3.datalink_val_to_name(999) is None
+    assert pypcap3.datalink_val_to_description(999) is None
+    for dlt, name, description in pypcap3.open_dead().list_datalinks():
+        assert pypcap3.datalink_name_to_val(name) == dlt
+    with pytest.raises(pypcap3.error, match="unknown link type 'nonsense'"):
+        pypcap3.datalink_name_to_val('nonsense')
+    with pytest.raises(pypcap3.error, match='must be a string'):
+        pypcap3.datalink_name_to_val(1)
+    with pytest.raises(pypcap3.error, match='must be an integer'):
+        pypcap3.datalink_val_to_name('EN10MB')
+
+
+def test_tstamp_type_lookups():
+    assert pypcap3.tstamp_type_name_to_val('host') == pypcap3.TSTAMP_HOST
+    assert pypcap3.tstamp_type_name_to_val('adapter') == pypcap3.TSTAMP_ADAPTER
+    assert pypcap3.tstamp_type_val_to_name(pypcap3.TSTAMP_ADAPTER_UNSYNCED) == 'adapter_unsynced'
+    assert pypcap3.tstamp_type_val_to_name(99) is None
+    with pytest.raises(pypcap3.error, match="unknown timestamp type"):
+        pypcap3.tstamp_type_name_to_val('sundial')
+
+
+def test_set_datalink():
+    dead = pypcap3.open_dead()
+    assert dead.set_datalink(1) is None
+    with pytest.raises(pypcap3.error, match='not one of the DLTs'):
+        dead.set_datalink(DLT_RAW)
+    assert dead.datalink()[0] == 1
+
+
+@pytest.mark.parametrize('endian', ['<', '>'], ids=['little', 'big'])
+def test_file_details(tmp_path, packets, endian):
+    path = tmp_path / 'endian.pcap'
+    path.write_bytes(pcap_bytes(packets, endian=endian))
+    h = pypcap3.open_file(str(path))
+    assert (h.major_version(), h.minor_version()) == (2, 4)
+    assert h.is_swapped() is (endian != ('<' if sys.byteorder == 'little' else '>'))
+    assert [h.next() for _ in packets] == packets
+    h.close()
+
+
+def test_file_details_unactivated():
+    h = pypcap3.create('nosuch0')
+    for method in (h.major_version, h.minor_version, h.is_swapped):
+        with pytest.raises(pypcap3.error, match='not been activated'):
+            method()
+
+
+def test_dumper_tell(tmp_path):
+    with pypcap3.open_dead().dump_open(tmp_path / 'tell.pcap') as dumper:
+        assert dumper.tell() == 24  # the file header
+        dumper.write(b'\x00' * 60, ts=1)
+        assert dumper.tell() == 24 + 16 + 60
+        dumper.write(b'\x00' * 100, ts=2)
+        assert dumper.tell() == 24 + 2 * 16 + 60 + 100
+    assert (tmp_path / 'tell.pcap').stat().st_size == 24 + 2 * 16 + 60 + 100
+
+
+@pytest.mark.skipif(sys.platform == 'win32', reason='file objects need POSIX descriptors')
+def test_dumper_tell_on_pipe():
+    rfd, wfd = os.pipe()
+    try:
+        with pypcap3.open_dead().dump_open(wfd) as dumper:
+            with pytest.raises(pypcap3.error):
+                dumper.tell()
+    finally:
+        os.close(rfd)
+        os.close(wfd)

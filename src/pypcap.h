@@ -70,6 +70,12 @@ static PyPCAP * pypcap_open_dead (PyObject * self, PyObject * arguments, PyObjec
 
 static PyObject * pypcap_lookupnet (PyObject * self, PyObject * interface);
 
+static PyObject * pypcap_datalink_name_to_val        (PyObject * self, PyObject * name);
+static PyObject * pypcap_datalink_val_to_name        (PyObject * self, PyObject * value);
+static PyObject * pypcap_datalink_val_to_description (PyObject * self, PyObject * value);
+static PyObject * pypcap_tstamp_type_name_to_val     (PyObject * self, PyObject * name);
+static PyObject * pypcap_tstamp_type_val_to_name     (PyObject * self, PyObject * value);
+
 static PyMethodDef PyPCAP_methods[] = {
     { "version",      (PyCFunction)pypcap_version,   METH_NOARGS,  "return the version"                },
     { "find",         (PyCFunction)pypcap_find,      METH_NOARGS,
@@ -85,6 +91,11 @@ static PyMethodDef PyPCAP_methods[] = {
       "open_dead(linktype=1, snaplen=65535, precision=TSTAMP_PRECISION_MICRO): a handle with no device, "
       "for compiling filters and writing files" },
     { "lookupnet",    (PyCFunction)pypcap_lookupnet, METH_O,       "(network, netmask) of an interface" },
+    { "datalink_name_to_val",        (PyCFunction)pypcap_datalink_name_to_val,        METH_O, "link type number for a name such as 'EN10MB'" },
+    { "datalink_val_to_name",        (PyCFunction)pypcap_datalink_val_to_name,        METH_O, "name of a link type number, or None" },
+    { "datalink_val_to_description", (PyCFunction)pypcap_datalink_val_to_description, METH_O, "description of a link type number, or None" },
+    { "tstamp_type_name_to_val",     (PyCFunction)pypcap_tstamp_type_name_to_val,     METH_O, "TSTAMP_* value for a name such as 'adapter'" },
+    { "tstamp_type_val_to_name",     (PyCFunction)pypcap_tstamp_type_val_to_name,     METH_O, "name of a TSTAMP_* value, or None" },
     { NULL }
 };
 
@@ -107,6 +118,10 @@ static PyObject * pypcap_stats          (PyPCAP *self);
 static PyObject * pypcap_geterr         (PyPCAP *self);
 static PyObject * pypcap_list_datalinks (PyPCAP *self);
 static PyObject * pypcap_datalink       (PyPCAP *self);
+static PyObject * pypcap_set_datalink   (PyPCAP *self, PyObject *value);
+static PyObject * pypcap_major_version  (PyPCAP *self);
+static PyObject * pypcap_minor_version  (PyPCAP *self);
+static PyObject * pypcap_is_swapped     (PyPCAP *self);
 static PyObject * pypcap_set_snaplen    (PyPCAP *self, PyObject *snaplen);
 static PyObject * pypcap_set_promisc    (PyPCAP *self, PyObject *promisc);
 static PyObject * pypcap_setnonblock    (PyPCAP *self, PyObject *blocking);
@@ -146,6 +161,10 @@ static PyMethodDef PyPCAP_Type_methods[] = {
     { "geterr",        (PyCFunction)pypcap_geterr,         METH_NOARGS,  "print the last error"               },
     { "list_datalinks",(PyCFunction)pypcap_list_datalinks, METH_NOARGS,  "return list of supported datalinks" },
     { "datalink",      (PyCFunction)pypcap_datalink,       METH_NOARGS,  "get datalink"                       },
+    { "set_datalink",  (PyCFunction)pypcap_set_datalink,   METH_O,       "switch to another of list_datalinks()" },
+    { "major_version", (PyCFunction)pypcap_major_version,  METH_NOARGS,  "major version of a capture file's format" },
+    { "minor_version", (PyCFunction)pypcap_minor_version,  METH_NOARGS,  "minor version of a capture file's format" },
+    { "is_swapped",    (PyCFunction)pypcap_is_swapped,     METH_NOARGS,  "whether a capture file uses the other byte order" },
     { "set_snaplen",   (PyCFunction)pypcap_set_snaplen,    METH_O,       "set snaplen"                        },
     { "set_promisc",   (PyCFunction)pypcap_set_promisc,    METH_O,       "set promiscuous mode"               },
     { "setnonblock",   (PyCFunction)pypcap_setnonblock,    METH_O,       "set blocking or non-blocking"       },
@@ -231,6 +250,7 @@ static PyTypeObject PyBPF_Type = {
 static void       pypcap_dumper_dealloc (PyDumper *self);
 static PyObject * pypcap_dumper_write   (PyDumper *self, PyObject *arguments, PyObject *keywords);
 static PyObject * pypcap_dumper_flush   (PyDumper *self);
+static PyObject * pypcap_dumper_tell    (PyDumper *self);
 static PyObject * pypcap_dumper_close   (PyDumper *self);
 static PyObject * pypcap_dumper_enter   (PyDumper *self);
 static PyObject * pypcap_dumper_exit    (PyDumper *self, PyObject *arguments);
@@ -239,6 +259,7 @@ static PyMethodDef PyDumper_Type_methods[] = {
     { "write",         (PyCFunction)pypcap_dumper_write,   METH_VARARGS | METH_KEYWORDS,
       "write(packet, ts=None, orig_len=None): ts defaults to now, orig_len to len(packet)" },
     { "flush",         (PyCFunction)pypcap_dumper_flush,   METH_NOARGS,  "flush buffered packets to the file" },
+    { "tell",          (PyCFunction)pypcap_dumper_tell,    METH_NOARGS,  "bytes written so far, including the file header" },
     { "close",         (PyCFunction)pypcap_dumper_close,   METH_NOARGS,  "flush and close the file"           },
     { "__enter__",     (PyCFunction)pypcap_dumper_enter,   METH_NOARGS,  NULL                                 },
     { "__exit__",      (PyCFunction)pypcap_dumper_exit,    METH_VARARGS, NULL                                 },
