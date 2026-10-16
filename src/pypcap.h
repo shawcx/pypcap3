@@ -59,6 +59,19 @@ typedef struct {
     int busy;      // set while loop() writes to it with the GIL released
 } PyDumper;
 
+typedef struct {
+    PyObject_HEAD
+    PyPCAP *handle;
+    int header;    // yield (packet, ts, orig_len) instead of just the packet
+} PyPacketIter;
+
+#ifdef WIN32
+typedef struct {
+    PyObject_HEAD
+    pcap_send_queue *queue;
+} PySendQueue;
+#endif // WIN32
+
 static PyObject * pypcap_version   (PyObject * self);
 static PyObject * pypcap_find      (PyObject * self);
 static PyObject * pypcap_mac       (PyObject * self, PyObject * iface);
@@ -75,6 +88,13 @@ static PyObject * pypcap_datalink_val_to_name        (PyObject * self, PyObject 
 static PyObject * pypcap_datalink_val_to_description (PyObject * self, PyObject * value);
 static PyObject * pypcap_tstamp_type_name_to_val     (PyObject * self, PyObject * name);
 static PyObject * pypcap_tstamp_type_val_to_name     (PyObject * self, PyObject * value);
+
+#ifdef WIN32
+static PyPCAP *   pypcap_open_remote  (PyObject * self, PyObject * arguments, PyObject * keywords);
+static PyObject * pypcap_find_remote  (PyObject * self, PyObject * arguments, PyObject * keywords);
+static PyObject * pypcap_createsrcstr (PyObject * self, PyObject * arguments, PyObject * keywords);
+static PyObject * pypcap_parsesrcstr  (PyObject * self, PyObject * source);
+#endif // WIN32
 
 static PyMethodDef PyPCAP_methods[] = {
     { "version",      (PyCFunction)pypcap_version,   METH_NOARGS,  "return the version"                },
@@ -96,6 +116,17 @@ static PyMethodDef PyPCAP_methods[] = {
     { "datalink_val_to_description", (PyCFunction)pypcap_datalink_val_to_description, METH_O, "description of a link type number, or None" },
     { "tstamp_type_name_to_val",     (PyCFunction)pypcap_tstamp_type_name_to_val,     METH_O, "TSTAMP_* value for a name such as 'adapter'" },
     { "tstamp_type_val_to_name",     (PyCFunction)pypcap_tstamp_type_val_to_name,     METH_O, "name of a TSTAMP_* value, or None" },
+#ifdef WIN32
+    { "open_remote",  (PyCFunction)pypcap_open_remote,  METH_VARARGS | METH_KEYWORDS,
+      "open_remote(source, snaplen=65535, flags=0, read_timeout=100, username=None, password=None): "
+      "open an rpcap://, file:// or local source" },
+    { "find_remote",  (PyCFunction)pypcap_find_remote,  METH_VARARGS | METH_KEYWORDS,
+      "find_remote(source, username=None, password=None): like find(), for the devices behind a source" },
+    { "createsrcstr", (PyCFunction)pypcap_createsrcstr, METH_VARARGS | METH_KEYWORDS,
+      "createsrcstr(type, host=None, port=None, name=None): build a source string from SRC_* and its parts" },
+    { "parsesrcstr",  (PyCFunction)pypcap_parsesrcstr,  METH_O,
+      "(type, host, port, name) of a source string" },
+#endif // WIN32
     { NULL }
 };
 
@@ -149,8 +180,23 @@ static PyObject * pypcap_inject         (PyPCAP *self, PyObject *packet);
 static PyObject * pypcap_setfilter      (PyPCAP *self, PyObject *arguments, PyObject *keywords);
 static PyObject * pypcap_compile        (PyPCAP *self, PyObject *arguments, PyObject *keywords);
 static PyObject * pypcap_dump_open      (PyPCAP *self, PyObject *arguments, PyObject *keywords);
+static PyObject * pypcap_packets        (PyPCAP *self, PyObject *arguments, PyObject *keywords);
+static PyObject * pypcap_enter          (PyPCAP *self);
+static PyObject * pypcap_exit           (PyPCAP *self, PyObject *arguments);
+static PyObject * pypcap_iter           (PyPCAP *self);
+#ifdef __linux__
+static PyObject * pypcap_set_protocol_linux (PyPCAP *self, PyObject *value);
+#endif // __linux__
 #ifdef WIN32
 static PyObject * pypcap_getevent       (PyPCAP *self);
+static PyObject * pypcap_setbuff        (PyPCAP *self, PyObject *value);
+static PyObject * pypcap_setmintocopy   (PyPCAP *self, PyObject *value);
+static PyObject * pypcap_setmode        (PyPCAP *self, PyObject *value);
+static PyObject * pypcap_stats_ex       (PyPCAP *self);
+static PyObject * pypcap_oid_get_request(PyPCAP *self, PyObject *arguments);
+static PyObject * pypcap_oid_set_request(PyPCAP *self, PyObject *arguments);
+static PyObject * pypcap_sendqueue_transmit (PyPCAP *self, PyObject *arguments, PyObject *keywords);
+static PyObject * pypcap_setsampling    (PyPCAP *self, PyObject *arguments);
 #endif // WIN32
 
 static PyMethodDef PyPCAP_Type_methods[] = {
@@ -201,22 +247,62 @@ static PyMethodDef PyPCAP_Type_methods[] = {
       "compile(expression, optimize=True, netmask=None): compile a BPF expression for this handle" },
     { "dump_open",     (PyCFunction)pypcap_dump_open,      METH_VARARGS | METH_KEYWORDS,
       "dump_open(file, append=False): write packets to a path, file object or descriptor" },
+    { "packets",       (PyCFunction)pypcap_packets,        METH_VARARGS | METH_KEYWORDS,
+      "packets(*, header=False): iterate over packets, or (packet, ts, orig_len) with header=True" },
+    { "__enter__",     (PyCFunction)pypcap_enter,          METH_NOARGS,  NULL                                 },
+    { "__exit__",      (PyCFunction)pypcap_exit,           METH_VARARGS, NULL                                 },
+#ifdef __linux__
+    { "set_protocol_linux", (PyCFunction)pypcap_set_protocol_linux, METH_O,
+      "capture only this EtherType (such as 0x0806), before activate()" },
+#endif // __linux__
 #ifdef WIN32
     { "getevent",      (PyCFunction)pypcap_getevent,       METH_NOARGS,  "get an event handle"                },
+    { "setbuff",       (PyCFunction)pypcap_setbuff,        METH_O,       "set the driver buffer size in bytes" },
+    { "setmintocopy",  (PyCFunction)pypcap_setmintocopy,   METH_O,       "bytes the driver waits for before a read returns" },
+    { "setmode",       (PyCFunction)pypcap_setmode,        METH_O,       "MODE_CAPT or MODE_STAT"             },
+    { "stats_ex",      (PyCFunction)pypcap_stats_ex,       METH_NOARGS,  "stats() plus Npcap's capt, sent and netdrop counters" },
+    { "oid_get_request", (PyCFunction)pypcap_oid_get_request, METH_VARARGS, "oid_get_request(oid, size): query an adapter OID" },
+    { "oid_set_request", (PyCFunction)pypcap_oid_set_request, METH_VARARGS, "oid_set_request(oid, data): set an adapter OID" },
+    { "sendqueue_transmit", (PyCFunction)pypcap_sendqueue_transmit, METH_VARARGS | METH_KEYWORDS,
+      "sendqueue_transmit(queue, sync=False): send a sendqueue, keeping its timing with sync=True; returns bytes sent" },
+    { "setsampling",   (PyCFunction)pypcap_setsampling,    METH_VARARGS, "setsampling(method, value): SAMP_* sampling for remote captures" },
 #endif // WIN32
     { NULL }
 };
 
 static PyTypeObject PyPCAP_Type = {
     PyVarObject_HEAD_INIT(NULL, 0)
-    .tp_name      = "pypcap",
-    .tp_doc       = "pypcap Class",
+    .tp_name      = "pypcap3.handle",
+    .tp_doc       = "capture handle, from open_live(), open_file(), create() or open_dead()",
     .tp_basicsize = sizeof(PyPCAP),
     .tp_new       = PyType_GenericNew,
     .tp_init      = (initproc)pypcap_init,
     .tp_dealloc   = (destructor)pypcap_dealloc,
     .tp_flags     = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE,
+    .tp_iter      = (getiterfunc)pypcap_iter,
     .tp_methods   = PyPCAP_Type_methods,
+};
+
+
+static void       pypcap_packet_iter_dealloc (PyPacketIter *self);
+static PyObject * pypcap_packet_iter_next    (PyPacketIter *self);
+
+// packet_iterator[bytes] in annotations, matching the type stubs
+static PyMethodDef PyPacketIter_Type_methods[] = {
+    { "__class_getitem__", (PyCFunction)Py_GenericAlias, METH_O | METH_CLASS, NULL },
+    { NULL }
+};
+
+static PyTypeObject PyPacketIter_Type = {
+    PyVarObject_HEAD_INIT(NULL, 0)
+    .tp_name      = "pypcap3.packet_iterator",
+    .tp_doc       = "packets from iter(handle) or handle.packets()",
+    .tp_basicsize = sizeof(PyPacketIter),
+    .tp_dealloc   = (destructor)pypcap_packet_iter_dealloc,
+    .tp_flags     = Py_TPFLAGS_DEFAULT,
+    .tp_iter      = PyObject_SelfIter,
+    .tp_iternext  = (iternextfunc)pypcap_packet_iter_next,
+    .tp_methods   = PyPacketIter_Type_methods,
 };
 
 
@@ -275,6 +361,39 @@ static PyTypeObject PyDumper_Type = {
     .tp_flags     = Py_TPFLAGS_DEFAULT,
     .tp_methods   = PyDumper_Type_methods,
 };
+
+
+#ifdef WIN32
+static PyObject * pypcap_sendqueue_new     (PyTypeObject *type, PyObject *arguments, PyObject *keywords);
+static void       pypcap_sendqueue_dealloc (PySendQueue *self);
+static PyObject * pypcap_sendqueue_queue   (PySendQueue *self, PyObject *arguments, PyObject *keywords);
+static PyObject * pypcap_sendqueue_size    (PySendQueue *self, void *closure);
+static PyObject * pypcap_sendqueue_used    (PySendQueue *self, void *closure);
+
+static PyMethodDef PySendQueue_Type_methods[] = {
+    { "queue",         (PyCFunction)pypcap_sendqueue_queue, METH_VARARGS | METH_KEYWORDS,
+      "queue(packet, ts=None, orig_len=None): add a packet; ts sets its timing for sync transmits" },
+    { NULL }
+};
+
+static PyGetSetDef PySendQueue_Type_getset[] = {
+    { "size", (getter)pypcap_sendqueue_size, NULL, "capacity in bytes",                   NULL },
+    { "used", (getter)pypcap_sendqueue_used, NULL, "bytes queued, including packet headers", NULL },
+    { NULL }
+};
+
+static PyTypeObject PySendQueue_Type = {
+    PyVarObject_HEAD_INIT(NULL, 0)
+    .tp_name      = "pypcap3.sendqueue",
+    .tp_doc       = "sendqueue(memsize): up to memsize bytes of packets for handle.sendqueue_transmit()",
+    .tp_basicsize = sizeof(PySendQueue),
+    .tp_new       = pypcap_sendqueue_new,
+    .tp_dealloc   = (destructor)pypcap_sendqueue_dealloc,
+    .tp_flags     = Py_TPFLAGS_DEFAULT,
+    .tp_methods   = PySendQueue_Type_methods,
+    .tp_getset    = PySendQueue_Type_getset,
+};
+#endif // WIN32
 
 #ifdef WIN32
 static int get_canonical(char *guid, char *name);

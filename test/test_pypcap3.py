@@ -1,3 +1,4 @@
+import ast
 import faulthandler
 import ipaddress
 import os
@@ -789,7 +790,8 @@ def test_select_then_dispatch(packets):
 
 
 @pytest.mark.skipif(sys.platform == 'win32', reason='needs /dev/fd and pthread_kill')
-def test_sigint_interrupts_blocked_next():
+@pytest.mark.parametrize('read', [lambda h: h.next(), lambda h: next(iter(h))], ids=['next', 'iteration'])
+def test_sigint_interrupts_blocked_read(read):
     rfd, wfd = os.pipe()
     os.write(wfd, pcap_bytes([]))
     main = threading.get_ident()
@@ -807,7 +809,7 @@ def test_sigint_interrupts_blocked_next():
     try:
         h = pypcap3.open_file(f'/dev/fd/{rfd}')
         with pytest.raises(KeyboardInterrupt):
-            h.next()
+            read(h)
         h.close()
     finally:
         done.set()
@@ -1095,3 +1097,126 @@ def test_dumper_tell_on_pipe():
     finally:
         os.close(rfd)
         os.close(wfd)
+
+
+# iteration, context managers and the module's types
+
+
+def test_iterate_handle(handle, packets):
+    assert list(handle) == packets
+    assert list(handle) == []  # at the end of the file
+
+
+def test_iterate_with_header(handle, packets):
+    seen = list(handle.packets(header=True))
+    assert [data for data, _, _ in seen] == packets
+    assert seen[1][1] == pytest.approx(1700000001.001007, abs=1e-6)
+    assert all(orig_len == len(data) for data, _, orig_len in seen)
+
+
+def test_iteration_interleaves_with_next(handle, packets):
+    packet_iter = iter(handle)
+    assert next(packet_iter) == packets[0]
+    assert handle.next() == packets[1]
+    assert next(packet_iter) == packets[2]
+
+
+def test_iteration_respects_filter_and_close(make_pcap, mixed):
+    h = pypcap3.open_file(make_pcap(mixed))
+    h.setfilter('udp port 53')
+    packet_iter = iter(h)
+    assert next(packet_iter) == mixed[0]
+    h.close()
+    with pytest.raises(pypcap3.error, match='no device opened'):
+        next(packet_iter)
+
+
+def test_iterate_closed_handle(handle):
+    handle.close()
+    with pytest.raises(pypcap3.error, match='no device opened'):
+        iter(handle)
+
+
+def test_handle_context_manager(make_pcap, packets):
+    with pypcap3.open_file(make_pcap(packets)) as h:
+        assert h.next() == packets[0]
+    with pytest.raises(pypcap3.error, match='no device opened'):
+        h.next()
+
+    with pytest.raises(ValueError):
+        with pypcap3.open_file(make_pcap(packets)) as h:
+            raise ValueError
+    with pytest.raises(pypcap3.error, match='no device opened'):
+        h.next()
+
+
+def test_module_types(handle, tmp_path):
+    assert isinstance(handle, pypcap3.handle)
+    assert isinstance(handle.compile('udp'), pypcap3.bpf_program)
+    assert isinstance(iter(handle), pypcap3.packet_iterator)
+    with handle.dump_open(tmp_path / 'types.pcap') as dumper:
+        assert isinstance(dumper, pypcap3.dumper)
+    assert repr(handle).startswith('<pypcap3.handle object')
+    assert pypcap3.packet_iterator[bytes].__origin__ is pypcap3.packet_iterator
+    # a handle made directly has no device behind it
+    with pytest.raises(pypcap3.error, match='no device opened'):
+        pypcap3.handle().next()
+    for cls in (pypcap3.bpf_program, pypcap3.dumper, pypcap3.packet_iterator):
+        with pytest.raises(TypeError):
+            cls()
+
+
+def test_write_orig_len_none(tmp_path):
+    with pypcap3.open_dead().dump_open(tmp_path / 'none.pcap') as dumper:
+        dumper.write(b'\x00' * 60, 1.0, None)
+    assert read_pcap(tmp_path / 'none.pcap')[2][0][2] == 60
+
+
+@pytest.mark.skipif(not sys.platform.startswith('linux'), reason='Linux only')
+def test_set_protocol_linux(handle):
+    h = pypcap3.create('nosuch0')
+    assert h.set_protocol_linux(0x0806) is None
+    h.close()
+    with pytest.raises(pypcap3.error, match='activated'):
+        handle.set_protocol_linux(0x0806)
+
+
+# type stubs
+
+
+STUB = pathlib.Path(__file__).resolve().parent.parent / 'pypcap3-stubs' / '__init__.pyi'
+# dunders compared between the stub and the module; others such as __init__ aren't
+DUNDERS = {'__enter__', '__exit__', '__iter__', '__next__', '__len__'}
+
+
+def _stub_platform(test):
+    # the stub branches only on `sys.platform == "..."` and `!=`
+    assert ast.unparse(test.left) == 'sys.platform', ast.unparse(test)
+    value = test.comparators[0].value
+    return sys.platform == value if isinstance(test.ops[0], ast.Eq) else sys.platform != value
+
+
+def _stub_names(body):
+    names = {}
+    for node in body:
+        if isinstance(node, ast.If):
+            names.update(_stub_names(node.body if _stub_platform(node.test) else node.orelse))
+        elif isinstance(node, ast.AnnAssign):
+            names[node.target.id] = node
+        elif isinstance(node, ast.Assign):
+            names.update((target.id, node) for target in node.targets)
+        elif isinstance(node, (ast.FunctionDef, ast.ClassDef)):
+            names[node.name] = node
+    return names
+
+
+def _compared(names):
+    return {name for name in names if not name.startswith('_') or name in DUNDERS}
+
+
+def test_stubs_match_module():
+    stub = _stub_names(ast.parse(STUB.read_text()).body)
+    assert _compared(stub) == _compared(dir(pypcap3))
+    for name, node in stub.items():
+        if isinstance(node, ast.ClassDef) and not name.startswith('_') and name != 'error':
+            assert _compared(_stub_names(node.body)) == _compared(vars(getattr(pypcap3, name))), name

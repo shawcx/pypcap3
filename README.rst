@@ -18,10 +18,9 @@ Capture DNS traffic to a file until Ctrl-C (live capture needs root)::
 
 Read it back with timestamps, or test a filter without a device::
 
-    handle = pypcap3.open_file('dns.pcap')
-    while (result := handle.next(header=True)) is not None:
-        packet, ts, orig_len = result
-        print(ts, orig_len)
+    with pypcap3.open_file('dns.pcap') as handle:
+        for packet, ts, orig_len in handle.packets(header=True):
+            print(ts, orig_len)
 
     program = pypcap3.open_dead().compile('udp port 53')
     program.match(packet)  # True

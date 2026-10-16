@@ -8,9 +8,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Packaging
 
-- **`pyproject.toml`** holds all project metadata, including the version and the SPDX license (which is why it needs `setuptools>=77`). It also sets `packages = []`, because otherwise setuptools treats `src/` as a src-layout package directory and writes `egg-info` into it.
+- **`pyproject.toml`** holds all project metadata, including the version and the SPDX license (which is why it needs `setuptools>=77`). Its only package is `pypcap3-stubs`, the PEP 561 type stubs; mypy and pyright look for a `-stubs` package because a single-module extension can't carry `py.typed`. Listing it explicitly also turns off auto-discovery, which would otherwise treat `src/` as a src-layout package directory and write `egg-info` into it.
 - **`setup.py`** only declares the extension, because the `define_macros` and `libraries` depend on `sys.platform`. Declaring `src/pypcap.h` in `depends` makes header edits trigger a rebuild.
-- **`MANIFEST.in`** ships `src/*.c`, `src/*.h` and `README.rst` in the sdist, which the Debian package is built from (`deb_dist/` is the gitignored output).
+- **`MANIFEST.in`** ships `src/*.c`, `src/*.h`, the stubs and `README.rst` in the sdist, which the Debian package is built from (`deb_dist/` is the gitignored output).
 
 ## Build and run
 
@@ -41,19 +41,30 @@ PYTHONPATH=. pytest -k loop              # tests matching a name
 - It checks written files byte for byte with `read_pcap()`, a small parser that also reads microsecond and nanosecond files.
 - It uses unactivated `create('nosuch0')` handles for the live-capture error paths.
 
-`.github/workflows/ci.yml` runs the suite on Ubuntu and macOS with Python 3.9 and 3.14. On Windows it only builds a wheel against the Npcap SDK (`NPCAP_SDK_VERSION`), because running the tests needs the Npcap driver, and its free installer can't run unattended. All of the Windows-only C code is therefore compiled in CI but never run.
+Keep the stubs (`pypcap3-stubs/__init__.pyi`) in step with the C code. Three checks enforce this:
+
+- `test_stubs_match_module` compares their names with the compiled module and its types, following the stub's `sys.platform` branches.
+- In CI, `python -m mypy.stubtest pypcap3 --allowlist stubtest-allowlist.txt` also compares signatures.
+- In CI, `python -m mypy --strict test/typing_check.py` checks the types they give common calls.
+
+Both CI checks need a regular install (`pip install --group typing .`), not an editable one, so that mypy finds the stub package.
+
+`.github/workflows/ci.yml` runs the suite on Ubuntu and macOS with Python 3.9 and 3.14, plus the typing job. On Windows it only builds a wheel against the Npcap SDK (`NPCAP_SDK_VERSION`), because running the tests needs the Npcap driver, and its free installer can't run unattended. All of the Windows-only C code is therefore compiled in CI but never run.
 
 Two tests rely on threads and signals:
 
-- **`test_sigint_interrupts_blocked_loop`** and **`test_sigint_interrupts_blocked_next`** feed a pipe through `/dev/fd/N`, then send SIGINT while `loop()` or `next()` is blocked on it. If either stops releasing the GIL, its test hangs. `test_select_then_dispatch` uses the same kind of pipe.
+- **`test_sigint_interrupts_blocked_loop`** and **`test_sigint_interrupts_blocked_read`** (for `next()` and iteration) feed a pipe through `/dev/fd/N`, then send SIGINT while the call is blocked on it. If either stops releasing the GIL, its test hangs. `test_select_then_dispatch` uses the same kind of pipe.
 - **`test_loops_run_concurrently_in_threads`** uses a barrier, so it fails if two threads can't run loops at the same time.
 
 `test_open_file_on_fifo_releases_gil` arms a `faulthandler` watchdog, which runs without the GIL. If `open_file()` ever holds the GIL while waiting for a FIFO's header again, the run exits after 10s instead of hanging.
 
 ## Architecture
 
-- **`src/pypcap.h` holds the Python-facing surface:** every function prototype, the `PyMethodDef` tables, the `PyModuleDef`, the three type objects (`PyPCAP_Type` for handles, `PyBPF_Type` for compiled filters, `PyDumper_Type` for file writers), and the defaults (`DEFAULT_SNAPLEN`, `DEFAULT_PROMISC`, `DEFAULT_TO_MS`). `src/pypcap.c` holds only the implementations. Adding a method means adding a prototype and a table entry in the header plus the body in the `.c` file.
-- **Module functions** (`find`, `mac`, `version`, `lookupnet`, `open_live`, `open_file`/`open_offline`, `create`, `open_dead`) are the only way to get a capture handle. `PyPCAP_Type` is not added to the module, so handles can't be constructed directly. Each handle wraps one `pcap_t *pd`, and `live` marks handles from `open_live()` or `create()`. Handle methods start with the `CTXCHECK` macro, which raises if `pd` is NULL (for example after `close()`). Any new method that touches `pd` needs it too, or it crashes on a closed handle.
+- **`src/pypcap.h` holds the Python-facing surface:** every function prototype, the `PyMethodDef` tables, the `PyModuleDef`, the type objects, and the defaults (`DEFAULT_SNAPLEN`, `DEFAULT_PROMISC`, `DEFAULT_TO_MS`). `src/pypcap.c` holds only the implementations. Adding a method means adding a prototype and a table entry in the header plus the body in the `.c` file.
+- **Types:** the module exposes its types as `handle`, `bpf_program`, `dumper`, `packet_iterator` and, on Windows, `sendqueue`, for `isinstance()` and type hints.
+  - Only `handle` can be subclassed, and calling `handle()` gives an unopened handle. Real handles come from `open_live`, `open_file`/`open_offline`, `create` or `open_dead` (and `open_remote` on Windows).
+  - `sendqueue(memsize)` is constructed directly. The other types can't be.
+- **Handles:** import calls `pcap_init(PCAP_CHAR_ENC_UTF_8)`, so libpcap takes and returns UTF-8 strings on Windows too. Each handle wraps one `pcap_t *pd`, and `live` marks handles from `open_live()` or `create()`. Handle methods start with the `CTXCHECK` macro, which raises if `pd` is NULL (for example after `close()`). Any new method that touches `pd` needs it too, or it crashes on a closed handle.
 - **Busy handles:** `loop()`, `dispatch()` and `next()` set `self->busy` while the GIL is released.
   - The `BUSYCHECK` macro makes `close()`, `loop()`, `dispatch()`, `next()` and `setfilter()` raise while it is set, so the `pcap_t` can't be closed, re-entered or refiltered from another thread or from inside the callback.
   - `breakloop()` is deliberately not guarded.
@@ -78,19 +89,24 @@ Two tests rely on threads and signals:
   - `set_datalink()` switches to another entry of `list_datalinks()`. Handles that can't switch accept their current link type and reject others.
   - Module-level `datalink_name_to_val`, `datalink_val_to_name`, `datalink_val_to_description`, `tstamp_type_name_to_val` and `tstamp_type_val_to_name` convert between names and numbers. Names have no `DLT_` prefix and match case-insensitively; unknown numbers give `None`.
   - `major_version()`, `minor_version()` and `is_swapped()` go through `file_property()`. They only mean something for capture files.
-- **Names:** the extension, `.m_name` and exception are all `pypcap3`, and the init function is `PyInit_pypcap3`; only the handle's `tp_name` still says `pypcap`. If you rename the module, the `PyInit_` symbol must match the `Extension` name in `setup.py`.
+- **Names:** the extension, `.m_name`, the exception and every `tp_name` (`pypcap3.handle` and so on) use `pypcap3`, and the init function is `PyInit_pypcap3`. If you rename the module, the `PyInit_` symbol must match the `Extension` name in `setup.py`.
 - **Errors:** all failures raise the module's single exception, `pypcap3.error`, usually with libpcap's error buffer or `pcap_statustostr` text. Every error path must set an exception before returning NULL; otherwise Python raises `SystemError`.
 - **Capture paths:**
   - `loop()` and `dispatch()` share `run_loop()`, which releases the GIL for `pcap_loop` or `pcap_dispatch`. `pypcap_handler` takes the GIL back for each packet through the `loop_ctx` passed as libpcap's `user` pointer.
   - An exception from the callback, or a pending signal, calls `pcap_breakloop` and is raised from the call. After `breakloop()`, `loop()` returns `None`.
   - `dispatch()` returns `loop_ctx.count`, not `pcap_dispatch`'s return value: on a file, macOS's libpcap 1.10.1 returns 0 when it reaches the end, even after handling packets.
-  - `next()` releases the GIL around `pcap_next_ex`. It returns the packet bytes, or `None` on timeout or EOF.
+  - `next()` and iteration share `read_packet()`, which releases the GIL around `pcap_next_ex` and takes the Ctrl-C hook. `next()` returns `None` on a timeout or at EOF.
+  - Iteration (`for p in handle`, or `handle.packets(header=True)`) yields from a `packet_iterator` that holds a reference to the handle.
+    - It ends at EOF or after `breakloop()`.
+    - A live timeout doesn't end it, except in non-blocking mode, where it ends once no packet is ready. That lets a `select()` loop drain the handle with `for`.
+  - Handles are context managers whose `__exit__` calls `close()`.
   - `header=True` (keyword-only) makes `next()` return `(packet, ts, orig_len)`, and makes `loop()` and `dispatch()` call `callback(packet, ts, orig_len)`. `ts` is a float, built by `timestamp_seconds()`.
   - Ctrl-C: `acquire_sigint()` lets the first blocked call (`loop`, `dispatch` or `next`) install a C SIGINT hook while `_g_pd` is NULL. The hook calls `pcap_breakloop` and then chains to the previous handler (Python's), so the call wakes up and raises `KeyboardInterrupt`. Calls running at the same time work, but can only be stopped with `breakloop()`.
   - On Linux, the read timeout doesn't fire while an interface is idle (libpcap documents that it might not). To poll, use `setnonblock(1)`, `select` on `get_selectable_fd()` (waking at least every `get_required_select_timeout()`) and `dispatch()`. Those two descriptor methods don't exist on Windows.
 - **Settings before `activate()`:**
   - `set_option()` backs every `set_*` setter: it takes an int, raises on a negative status, and returns a positive status (such as an unsupported timestamp type) as warning text.
   - `can_set_rfmon()` returns `False` for handles that aren't `live`, because libpcap's `pcap_can_set_rfmon` crashes on files and `open_dead()` handles.
+  - `set_protocol_linux()` (Linux only) takes an EtherType in host byte order.
 - **Timestamp precision:** in nanosecond mode, libpcap stores nanoseconds in `tv_usec`, so header timestamps (`is_nano()`) and `dumper.write()` (`PyDumper.nano`) scale by the handle's precision.
   - `open_file()` and `open_dead()` take `precision=`, and so do `create()` handles via `set_tstamp_precision()`.
   - macOS BPF rejects nanosecond precision on devices.
@@ -98,6 +114,12 @@ Two tests rely on threads and signals:
   - `mac()` uses a `sysctl` `NET_RT_IFLIST` query on macOS, the `SIOCGIFHWADDR` ioctl on Linux, and returns `None` on Windows.
   - On Windows, `find()` returns friendly connection names and `open_live()` accepts them. The two map to `\Device\NPF_{GUID}` through registry lookups (`get_canonical` and `get_guid`).
   - `setdirection` is a no-op on Windows, and `getevent` exists only there.
+  - Npcap-only methods:
+    - `setbuff`, `setmintocopy`, `setmode` (`MODE_*`), `stats_ex`, `oid_get_request`/`oid_set_request` and `sendqueue_transmit`.
+    - Passive-mode rpcap: `open_remote`, `find_remote`, `createsrcstr`/`parsesrcstr` and `setsampling` (`SRC_*`, `OPENFLAG_*`, `SAMP_*`). Active mode (`pcap_remoteact_*`) isn't wrapped.
+    - `open_remote` handles aren't `live`, because a `file://` source is a savefile.
+    - All of these are compiled in CI but have never been run.
+  - Npcap marks `pcap_fileno` deprecated "until a `pcap_handle` exists". It doesn't exist yet, so `fileno()` keeps calling `pcap_fileno`.
 - **`find()`:** `describe_device()` returns `{ifname: {"description", "flags", "addresses": [...]}}`. Each address has `family`, `addr`, `netmask`, `broadcast` and `dstaddr`, covering IPv4 and IPv6.
   - `flags` is checked against the `IF_*` constants.
   - The original flat `ip`, `netmask` and `broadcast` keys remain, taken from the last IPv4 address; `test/simple.py` relies on `ip`.

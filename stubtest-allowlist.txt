@@ -1,0 +1,4 @@
+# Exceptions for `python -m mypy.stubtest pypcap3 --allowlist stubtest-allowlist.txt`.
+#
+# stubtest sees C slot wrappers as (*args, **kwargs); handle() takes no arguments.
+pypcap3.handle.__init__

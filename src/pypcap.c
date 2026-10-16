@@ -10,6 +10,16 @@ PyObject *pypcap_error;
 PyMODINIT_FUNC PyInit_pypcap3(void) {
     int ok;
 
+#ifdef PCAP_CHAR_ENC_UTF_8
+    // libpcap 1.10+: take and return UTF-8 strings. Only Windows changes,
+    // where libpcap otherwise uses the local code page.
+    char errbuf[PCAP_ERRBUF_SIZE];
+    if(0 > pcap_init(PCAP_CHAR_ENC_UTF_8, errbuf)) {
+        PyErr_SetString(PyExc_ImportError, errbuf);
+        return NULL;
+    }
+#endif // PCAP_CHAR_ENC_UTF_8
+
     PyObject *mod = PyModule_Create(&PyPCAP_module);
     if(NULL == mod) {
         return NULL;
@@ -26,12 +36,39 @@ PyMODINIT_FUNC PyInit_pypcap3(void) {
     if(0 <= ok) {
         ok = PyType_Ready(&PyDumper_Type);
     }
+    if(0 <= ok) {
+        ok = PyType_Ready(&PyPacketIter_Type);
+    }
+#ifdef WIN32
+    if(0 <= ok) {
+        ok = PyType_Ready(&PySendQueue_Type);
+    }
+#endif // WIN32
     if(0 > ok) {
         Py_DECREF(mod);
         return NULL;
     }
 
-    Py_INCREF(&PyPCAP_Type);
+    // the types, for isinstance() and type hints; only handle can be
+    // instantiated directly, and gives an unopened handle
+    PyTypeObject *types[] = { &PyPCAP_Type, &PyBPF_Type, &PyDumper_Type, &PyPacketIter_Type,
+#ifdef WIN32
+        &PySendQueue_Type,
+#endif // WIN32
+    };
+    const char *names[] = { "handle", "bpf_program", "dumper", "packet_iterator",
+#ifdef WIN32
+        "sendqueue",
+#endif // WIN32
+    };
+    for(size_t idx = 0; idx < sizeof(types) / sizeof(types[0]); ++idx) {
+        Py_INCREF(types[idx]);
+        if(0 > PyModule_AddObject(mod, names[idx], (PyObject *)types[idx])) {
+            Py_DECREF(types[idx]);
+            Py_DECREF(mod);
+            return NULL;
+        }
+    }
 
     // PCAP DIRECTIONS
     PyModule_AddIntConstant(mod, "D_IN",    PCAP_D_IN);
@@ -48,6 +85,23 @@ PyMODINIT_FUNC PyInit_pypcap3(void) {
     PyModule_AddIntConstant(mod, "IF_CONNECTION_STATUS_CONNECTED",      PCAP_IF_CONNECTION_STATUS_CONNECTED);
     PyModule_AddIntConstant(mod, "IF_CONNECTION_STATUS_DISCONNECTED",   PCAP_IF_CONNECTION_STATUS_DISCONNECTED);
     PyModule_AddIntConstant(mod, "IF_CONNECTION_STATUS_NOT_APPLICABLE", PCAP_IF_CONNECTION_STATUS_NOT_APPLICABLE);
+
+#ifdef WIN32
+    // NPCAP: setmode(), remote sources and sampling
+    PyModule_AddIntConstant(mod, "MODE_CAPT",    MODE_CAPT);
+    PyModule_AddIntConstant(mod, "MODE_STAT",    MODE_STAT);
+    PyModule_AddIntConstant(mod, "SRC_FILE",     PCAP_SRC_FILE);
+    PyModule_AddIntConstant(mod, "SRC_IFLOCAL",  PCAP_SRC_IFLOCAL);
+    PyModule_AddIntConstant(mod, "SRC_IFREMOTE", PCAP_SRC_IFREMOTE);
+    PyModule_AddIntConstant(mod, "OPENFLAG_PROMISCUOUS",       PCAP_OPENFLAG_PROMISCUOUS);
+    PyModule_AddIntConstant(mod, "OPENFLAG_DATATX_UDP",        PCAP_OPENFLAG_DATATX_UDP);
+    PyModule_AddIntConstant(mod, "OPENFLAG_NOCAPTURE_RPCAP",   PCAP_OPENFLAG_NOCAPTURE_RPCAP);
+    PyModule_AddIntConstant(mod, "OPENFLAG_NOCAPTURE_LOCAL",   PCAP_OPENFLAG_NOCAPTURE_LOCAL);
+    PyModule_AddIntConstant(mod, "OPENFLAG_MAX_RESPONSIVENESS", PCAP_OPENFLAG_MAX_RESPONSIVENESS);
+    PyModule_AddIntConstant(mod, "SAMP_NOSAMP",           PCAP_SAMP_NOSAMP);
+    PyModule_AddIntConstant(mod, "SAMP_1_EVERY_N",        PCAP_SAMP_1_EVERY_N);
+    PyModule_AddIntConstant(mod, "SAMP_FIRST_AFTER_N_MS", PCAP_SAMP_FIRST_AFTER_N_MS);
+#endif // WIN32
 
     // TIMESTAMP PRECISIONS AND SOURCES
     PyModule_AddIntConstant(mod, "TSTAMP_PRECISION_MICRO",  PCAP_TSTAMP_PRECISION_MICRO);
@@ -163,20 +217,13 @@ error:
 }
 
 
-static PyObject * pypcap_find(PyObject *self) {
-    char errbuf[PCAP_ERRBUF_SIZE];
-    pcap_if_t *interfaces;
-    int ok;
-
+// {name: describe_device()} for a device list, which it frees. On Windows,
+// local devices are named by connection name (skipping any without one);
+// remote lists keep their rpcap:// names.
+static PyObject * devices_dict(pcap_if_t *interfaces, int canonical) {
 #ifdef WIN32
-    char canonical[MAX_PATH];
+    char connection[MAX_PATH];
 #endif // WIN32
-
-    ok = pcap_findalldevs(&interfaces, errbuf);
-    if(0 > ok) {
-        PyErr_SetString(pypcap_error, errbuf);
-        return NULL;
-    }
 
     PyObject *devices = PyDict_New();
     if(NULL == devices) {
@@ -185,14 +232,14 @@ static PyObject * pypcap_find(PyObject *self) {
     }
 
     for(pcap_if_t *current = interfaces; current; current = current->next) {
-#ifdef WIN32
-        // name devices by their connection name, skipping any without one
-        if(0 > get_canonical(current->name + 12, canonical)) {
-            continue;
-        }
-        const char *name = canonical;
-#else
         const char *name = current->name;
+#ifdef WIN32
+        if(canonical) {
+            if(0 > get_canonical(current->name + 12, connection)) {
+                continue;
+            }
+            name = connection;
+        }
 #endif // WIN32
 
         PyObject *device = describe_device(current);
@@ -208,6 +255,19 @@ static PyObject * pypcap_find(PyObject *self) {
     pcap_freealldevs(interfaces);
 
     return devices;
+}
+
+
+static PyObject * pypcap_find(PyObject *self) {
+    char errbuf[PCAP_ERRBUF_SIZE];
+    pcap_if_t *interfaces;
+
+    if(0 > pcap_findalldevs(&interfaces, errbuf)) {
+        PyErr_SetString(pypcap_error, errbuf);
+        return NULL;
+    }
+
+    return devices_dict(interfaces, 1);
 }
 
 
@@ -667,6 +727,11 @@ static PyObject * pypcap_tstamp_type_val_to_name(PyObject *self, PyObject *value
 
 
 static int pypcap_init(PyPCAP *self, PyObject *args, PyObject *kwds) {
+    static char *kwlist[] = { NULL };
+    if(FALSE == PyArg_ParseTupleAndKeywords(args, kwds, ":handle", kwlist)) {
+        return -1;
+    }
+
     self->pd   = NULL;
     self->busy = 0;
     self->live = 0;
@@ -858,7 +923,8 @@ static PyObject * set_option(PyPCAP *self, PyObject *value, int (*setter)(pcap_t
 
     ok = setter(self->pd, (int)number);
     if(0 > ok) {
-        PyErr_SetString(pypcap_error, pcap_statustostr(ok));
+        // PCAP_ERROR leaves its details in the error buffer
+        PyErr_SetString(pypcap_error, PCAP_ERROR == ok ? pcap_geterr(self->pd) : pcap_statustostr(ok));
         return NULL;
     }
     if(0 < ok) {
@@ -907,6 +973,15 @@ static PyObject * pypcap_set_tstamp_type(PyPCAP *self, PyObject *value) {
 static PyObject * pypcap_set_tstamp_precision(PyPCAP *self, PyObject *value) {
     return set_option(self, value, pcap_set_tstamp_precision, "timestamp precision");
 }
+
+#ifdef __linux__
+
+// the EtherType in host byte order; libpcap converts it for socket()
+static PyObject * pypcap_set_protocol_linux(PyPCAP *self, PyObject *value) {
+    return set_option(self, value, pcap_set_protocol_linux, "protocol");
+}
+
+#endif // __linux__
 
 
 static PyObject * pypcap_can_set_rfmon(PyPCAP *self) {
@@ -1274,6 +1349,50 @@ static PyObject * pypcap_breakloop(PyPCAP *self) {
 }
 
 
+// returned by read_packet() when it has set an exception
+#define READ_RAISED (-100)
+
+// one pcap_next_ex() for next() and iteration, with the GIL released and the
+// Ctrl-C hook taken. Returns 1 for a packet, 0 when a live read timed out,
+// PCAP_ERROR_BREAK at the end of a file or after breakloop(), or READ_RAISED.
+static int read_packet(PyPCAP *self, struct pcap_pkthdr **hdr, const u_char **data) {
+    int ok;
+
+    int hooked = acquire_sigint(self->pd);
+    self->busy = 1;
+    Py_BEGIN_ALLOW_THREADS
+        ok = pcap_next_ex(self->pd, hdr, data);
+    Py_END_ALLOW_THREADS
+    self->busy = 0;
+    release_sigint(hooked);
+
+    // as in loop(): Ctrl-C during a blocked read raises KeyboardInterrupt
+    if(0 > ok && 0 > PyErr_CheckSignals()) {
+        return READ_RAISED;
+    }
+
+    if(PCAP_ERROR == ok) {
+        PyErr_SetString(pypcap_error, pcap_geterr(self->pd));
+        return READ_RAISED;
+    }
+    if(0 > ok && PCAP_ERROR_BREAK != ok) {
+        PyErr_SetString(pypcap_error, pcap_statustostr(ok));
+        return READ_RAISED;
+    }
+
+    return ok;
+}
+
+
+static PyObject * packet_object(PyPCAP *self, const struct pcap_pkthdr *hdr, const u_char *data, int header) {
+    if(header) {
+        return Py_BuildValue("y#dI", data, (Py_ssize_t)hdr->caplen,
+            timestamp_seconds(&hdr->ts, is_nano(self->pd)), (unsigned int)hdr->len);
+    }
+    return PyBytes_FromStringAndSize((const char *)data, hdr->caplen);
+}
+
+
 static PyObject * pypcap_next(PyPCAP *self, PyObject *arguments, PyObject *keywords) {
     static char *kwlist[] = { "header", NULL };
     struct pcap_pkthdr *hdr;
@@ -1289,37 +1408,104 @@ static PyObject * pypcap_next(PyPCAP *self, PyObject *arguments, PyObject *keywo
         return NULL;
     }
 
-    int hooked = acquire_sigint(self->pd);
-    self->busy = 1;
-    Py_BEGIN_ALLOW_THREADS
-        ok = pcap_next_ex(self->pd, &hdr, &data);
-    Py_END_ALLOW_THREADS
-    self->busy = 0;
-    release_sigint(hooked);
+    ok = read_packet(self, &hdr, &data);
+    if(READ_RAISED == ok) {
+        return NULL;
+    }
+    if(1 == ok) {
+        return packet_object(self, hdr, data, header);
+    }
 
-    // as in loop(): Ctrl-C during a blocked read raises KeyboardInterrupt
-    if(0 > ok && 0 > PyErr_CheckSignals()) {
+    // timeout on a live capture, or end of a file: both mean no packet
+    Py_RETURN_NONE;
+}
+
+
+//
+// Iteration and context management
+//
+
+static PyObject * new_packet_iter(PyPCAP *self, int header) {
+    CTXCHECK
+
+    PyPacketIter *iter = PyObject_New(PyPacketIter, &PyPacketIter_Type);
+    if(NULL == iter) {
+        return NULL;
+    }
+    Py_INCREF(self);
+    iter->handle = self;
+    iter->header = header;
+
+    return (PyObject *)iter;
+}
+
+
+static PyObject * pypcap_iter(PyPCAP *self) {
+    return new_packet_iter(self, 0);
+}
+
+
+static PyObject * pypcap_packets(PyPCAP *self, PyObject *arguments, PyObject *keywords) {
+    static char *kwlist[] = { "header", NULL };
+    int header = 0;
+
+    if(FALSE == PyArg_ParseTupleAndKeywords(arguments, keywords, "|$p", kwlist, &header)) {
         return NULL;
     }
 
-    switch(ok) {
-    case 1:
-        if(header) {
-            return Py_BuildValue("y#dI", data, (Py_ssize_t)hdr->caplen,
-                timestamp_seconds(&hdr->ts, is_nano(self->pd)), (unsigned int)hdr->len);
+    return new_packet_iter(self, header);
+}
+
+
+static void pypcap_packet_iter_dealloc(PyPacketIter *self) {
+    Py_DECREF(self->handle);
+    Py_TYPE(self)->tp_free((PyObject *)self);
+}
+
+
+// Ends at the end of a file or after breakloop(). A live read that times out
+// keeps waiting, except in non-blocking mode, where iteration ends once no
+// packet is ready, so a select() loop can drain the handle with a for loop.
+static PyObject * pypcap_packet_iter_next(PyPacketIter *iter) {
+    PyPCAP *self = iter->handle;
+    struct pcap_pkthdr *hdr;
+    const u_char *data;
+    char errbuf[PCAP_ERRBUF_SIZE];
+
+    for(;;) {
+        CTXCHECK
+        BUSYCHECK
+
+        int ok = read_packet(self, &hdr, &data);
+        if(READ_RAISED == ok) {
+            return NULL;
         }
-        return PyBytes_FromStringAndSize((const char *)data, hdr->caplen);
-    case 0:
-    case PCAP_ERROR_BREAK:
-        // timeout on a live capture, or end of a file: both mean no packet
-        Py_RETURN_NONE;
-    case PCAP_ERROR:
-        PyErr_SetString(pypcap_error, pcap_geterr(self->pd));
-        return NULL;
-    default:
-        PyErr_SetString(pypcap_error, pcap_statustostr(ok));
-        return NULL;
+        if(1 == ok) {
+            return packet_object(self, hdr, data, iter->header);
+        }
+        if(PCAP_ERROR_BREAK == ok) {
+            return NULL;
+        }
+
+        if(0 < pcap_getnonblock(self->pd, errbuf)) {
+            return NULL;
+        }
+        if(0 > PyErr_CheckSignals()) {
+            return NULL;
+        }
     }
+}
+
+
+static PyObject * pypcap_enter(PyPCAP *self) {
+    CTXCHECK
+    Py_INCREF(self);
+    return (PyObject *)self;
+}
+
+
+static PyObject * pypcap_exit(PyPCAP *self, PyObject *arguments) {
+    return pypcap_close(self);
 }
 
 static PyObject * pypcap_fileno(PyPCAP *self) {
@@ -1641,42 +1827,35 @@ static void timestamp_now(struct timeval *tv) {
 }
 
 
-static PyObject * pypcap_dumper_write(PyDumper *self, PyObject *arguments, PyObject *keywords) {
-    static char *kwlist[] = { "packet", "ts", "orig_len", NULL };
-    Py_buffer packet;
-    PyObject *ts = Py_None;
+// a pcap_pkthdr for a packet of length bytes written by Python: ts in seconds
+// (None for now) stored at the given precision, the original length (None for
+// the packet's length) and, like a capture, at most snaplen bytes kept
+static int fill_header(struct pcap_pkthdr *header, Py_ssize_t length, PyObject *ts, PyObject *original, int nano, int snaplen) {
     Py_ssize_t orig_len = -1;
-    struct pcap_pkthdr header;
-    int ok;
-
-    DUMPCHECK
-    DUMPBUSYCHECK
-
-    ok = PyArg_ParseTupleAndKeywords(arguments, keywords, "y*|On", kwlist, &packet, &ts, &orig_len);
-    if(FALSE == ok) {
-        return NULL;
+    if(Py_None != original) {
+        orig_len = PyLong_AsSsize_t(original);
+        if(-1 == orig_len && PyErr_Occurred()) {
+            return -1;
+        }
     }
-
-    if(0 <= orig_len && orig_len < packet.len) {
-        PyBuffer_Release(&packet);
+    if(0 <= orig_len && orig_len < length) {
         PyErr_SetString(pypcap_error, "orig_len is shorter than the packet");
-        return NULL;
+        return -1;
     }
 
-    // a nanosecond file keeps nanoseconds in tv_usec
-    long scale = self->nano ? 1000000000 : 1000000;
+    // at nanosecond precision, tv_usec holds nanoseconds
+    long scale = nano ? 1000000000 : 1000000;
 
     if(Py_None == ts) {
-        timestamp_now(&header.ts);
-        if(self->nano) {
-            header.ts.tv_usec *= 1000;
+        timestamp_now(&header->ts);
+        if(nano) {
+            header->ts.tv_usec *= 1000;
         }
     }
     else {
         double seconds = PyFloat_AsDouble(ts);
         if(-1.0 == seconds && PyErr_Occurred()) {
-            PyBuffer_Release(&packet);
-            return NULL;
+            return -1;
         }
         double whole = floor(seconds);
         long fraction = (long)((seconds - whole) * scale + 0.5);
@@ -1684,13 +1863,37 @@ static PyObject * pypcap_dumper_write(PyDumper *self, PyObject *arguments, PyObj
             whole    += 1;
             fraction -= scale;
         }
-        header.ts.tv_sec  = (long)whole;
-        header.ts.tv_usec = fraction;
+        header->ts.tv_sec  = (long)whole;
+        header->ts.tv_usec = fraction;
     }
 
-    // like a capture: store at most snaplen bytes, but record the full length
-    header.len    = (bpf_u_int32)(0 <= orig_len ? orig_len : packet.len);
-    header.caplen = (bpf_u_int32)(packet.len < self->snaplen ? packet.len : self->snaplen);
+    header->len    = (bpf_u_int32)(0 <= orig_len ? orig_len : length);
+    header->caplen = (bpf_u_int32)(length < snaplen ? length : snaplen);
+
+    return 0;
+}
+
+
+static PyObject * pypcap_dumper_write(PyDumper *self, PyObject *arguments, PyObject *keywords) {
+    static char *kwlist[] = { "packet", "ts", "orig_len", NULL };
+    Py_buffer packet;
+    PyObject *ts = Py_None;
+    PyObject *orig_len = Py_None;
+    struct pcap_pkthdr header;
+    int ok;
+
+    DUMPCHECK
+    DUMPBUSYCHECK
+
+    ok = PyArg_ParseTupleAndKeywords(arguments, keywords, "y*|OO", kwlist, &packet, &ts, &orig_len);
+    if(FALSE == ok) {
+        return NULL;
+    }
+
+    if(0 > fill_header(&header, packet.len, ts, orig_len, self->nano, self->snaplen)) {
+        PyBuffer_Release(&packet);
+        return NULL;
+    }
 
     pcap_dump((u_char *)self->dumper, &header, packet.buf);
     PyBuffer_Release(&packet);
@@ -1765,6 +1968,353 @@ static PyObject * pypcap_getevent(PyPCAP *self) {
     CTXCHECK
     // a HANDLE is a pointer, too wide for a long on 64-bit Windows
     return PyLong_FromVoidPtr(pcap_getevent(self->pd));
+}
+
+
+//
+// Npcap: driver settings, statistics and adapter OIDs
+//
+
+static PyObject * pypcap_setbuff(PyPCAP *self, PyObject *value) {
+    return set_option(self, value, pcap_setbuff, "buffer size");
+}
+
+
+static PyObject * pypcap_setmintocopy(PyPCAP *self, PyObject *value) {
+    return set_option(self, value, pcap_setmintocopy, "minimum to copy");
+}
+
+
+static PyObject * pypcap_setmode(PyPCAP *self, PyObject *value) {
+    return set_option(self, value, pcap_setmode, "mode");
+}
+
+
+static PyObject * pypcap_stats_ex(PyPCAP *self) {
+    int size;
+
+    CTXCHECK
+
+    struct pcap_stat *stats = pcap_stats_ex(self->pd, &size);
+    if(NULL == stats) {
+        PyErr_SetString(pypcap_error, pcap_geterr(self->pd));
+        return NULL;
+    }
+
+    return Py_BuildValue("{s:I,s:I,s:I,s:I,s:I,s:I}",
+        "recv",    stats->ps_recv,
+        "drop",    stats->ps_drop,
+        "ifdrop",  stats->ps_ifdrop,
+        "capt",    stats->ps_capt,
+        "sent",    stats->ps_sent,
+        "netdrop", stats->ps_netdrop);
+}
+
+
+static PyObject * pypcap_oid_get_request(PyPCAP *self, PyObject *arguments) {
+    unsigned int oid;
+    Py_ssize_t size;
+
+    CTXCHECK
+
+    if(FALSE == PyArg_ParseTuple(arguments, "In", &oid, &size)) {
+        return NULL;
+    }
+    if(0 > size) {
+        PyErr_SetString(pypcap_error, "size must not be negative");
+        return NULL;
+    }
+
+    void *buffer = PyMem_Malloc(size ? size : 1);
+    if(NULL == buffer) {
+        return PyErr_NoMemory();
+    }
+
+    // the driver shortens length to what it returned
+    size_t length = (size_t)size;
+    if(0 > pcap_oid_get_request(self->pd, oid, buffer, &length)) {
+        PyMem_Free(buffer);
+        PyErr_SetString(pypcap_error, pcap_geterr(self->pd));
+        return NULL;
+    }
+
+    PyObject *result = PyBytes_FromStringAndSize(buffer, (Py_ssize_t)length);
+    PyMem_Free(buffer);
+    return result;
+}
+
+
+static PyObject * pypcap_oid_set_request(PyPCAP *self, PyObject *arguments) {
+    unsigned int oid;
+    Py_buffer data;
+
+    CTXCHECK
+
+    if(FALSE == PyArg_ParseTuple(arguments, "Iy*", &oid, &data)) {
+        return NULL;
+    }
+
+    size_t length = (size_t)data.len;
+    int ok = pcap_oid_set_request(self->pd, oid, data.buf, &length);
+    PyBuffer_Release(&data);
+    if(0 > ok) {
+        PyErr_SetString(pypcap_error, pcap_geterr(self->pd));
+        return NULL;
+    }
+
+    Py_RETURN_NONE;
+}
+
+
+//
+// Npcap: send queues
+//
+
+static PyObject * pypcap_sendqueue_new(PyTypeObject *type, PyObject *arguments, PyObject *keywords) {
+    static char *kwlist[] = { "memsize", NULL };
+    unsigned int memsize;
+
+    if(FALSE == PyArg_ParseTupleAndKeywords(arguments, keywords, "I", kwlist, &memsize)) {
+        return NULL;
+    }
+
+    PySendQueue *self = (PySendQueue *)type->tp_alloc(type, 0);
+    if(NULL == self) {
+        return NULL;
+    }
+
+    self->queue = pcap_sendqueue_alloc(memsize);
+    if(NULL == self->queue) {
+        Py_DECREF(self);
+        return PyErr_NoMemory();
+    }
+
+    return (PyObject *)self;
+}
+
+
+static void pypcap_sendqueue_dealloc(PySendQueue *self) {
+    if(NULL != self->queue) {
+        pcap_sendqueue_destroy(self->queue);
+        self->queue = NULL;
+    }
+    Py_TYPE(self)->tp_free((PyObject *)self);
+}
+
+
+static PyObject * pypcap_sendqueue_queue(PySendQueue *self, PyObject *arguments, PyObject *keywords) {
+    static char *kwlist[] = { "packet", "ts", "orig_len", NULL };
+    Py_buffer packet;
+    PyObject *ts = Py_None;
+    PyObject *orig_len = Py_None;
+    struct pcap_pkthdr header;
+
+    if(FALSE == PyArg_ParseTupleAndKeywords(arguments, keywords, "y*|OO", kwlist, &packet, &ts, &orig_len)) {
+        return NULL;
+    }
+
+    // timestamps only matter relative to each other, for sync transmits
+    if(0 > fill_header(&header, packet.len, ts, orig_len, 0, INT_MAX)) {
+        PyBuffer_Release(&packet);
+        return NULL;
+    }
+
+    int ok = pcap_sendqueue_queue(self->queue, &header, packet.buf);
+    PyBuffer_Release(&packet);
+    if(0 > ok) {
+        PyErr_SetString(pypcap_error, "send queue is full");
+        return NULL;
+    }
+
+    Py_RETURN_NONE;
+}
+
+
+static PyObject * pypcap_sendqueue_size(PySendQueue *self, void *closure) {
+    return PyLong_FromUnsignedLong(self->queue->maxlen);
+}
+
+
+static PyObject * pypcap_sendqueue_used(PySendQueue *self, void *closure) {
+    return PyLong_FromUnsignedLong(self->queue->len);
+}
+
+
+static PyObject * pypcap_sendqueue_transmit(PyPCAP *self, PyObject *arguments, PyObject *keywords) {
+    static char *kwlist[] = { "queue", "sync", NULL };
+    PySendQueue *queue;
+    int sync = 0;
+    u_int sent;
+
+    CTXCHECK
+    BUSYCHECK
+
+    if(FALSE == PyArg_ParseTupleAndKeywords(arguments, keywords, "O!|p", kwlist, &PySendQueue_Type, &queue, &sync)) {
+        return NULL;
+    }
+
+    // with sync, the driver waits between packets to match their timestamps
+    self->busy = 1;
+    Py_BEGIN_ALLOW_THREADS
+        sent = pcap_sendqueue_transmit(self->pd, queue->queue, sync);
+    Py_END_ALLOW_THREADS
+    self->busy = 0;
+
+    if(sent < queue->queue->len) {
+        PyErr_SetString(pypcap_error, pcap_geterr(self->pd));
+        return NULL;
+    }
+
+    return PyLong_FromUnsignedLong(sent);
+}
+
+
+//
+// Npcap: remote capture over rpcap (passive mode)
+//
+
+// username and password for pcap_open() and pcap_findalldevs_ex(), or NULL for no authentication
+static struct pcap_rmtauth * remote_auth(struct pcap_rmtauth *auth, const char *username, const char *password) {
+    if(NULL == username && NULL == password) {
+        return NULL;
+    }
+
+    memset(auth, 0, sizeof(*auth));
+    auth->type     = RPCAP_RMTAUTH_PWD;
+    auth->username = (char *)username;
+    auth->password = (char *)password;
+    return auth;
+}
+
+
+static PyPCAP * pypcap_open_remote(PyObject *self, PyObject *arguments, PyObject *keywords) {
+    static char *kwlist[] = { "source", "snaplen", "flags", "read_timeout", "username", "password", NULL };
+    const char *source;
+    int snaplen      = DEFAULT_SNAPLEN;
+    int flags        = 0;
+    int read_timeout = DEFAULT_TO_MS;
+    const char *username = NULL;
+    const char *password = NULL;
+    struct pcap_rmtauth auth;
+    char errbuf[PCAP_ERRBUF_SIZE];
+    pcap_t *pd;
+
+    if(FALSE == PyArg_ParseTupleAndKeywords(arguments, keywords, "s|iiizz", kwlist,
+            &source, &snaplen, &flags, &read_timeout, &username, &password)) {
+        return NULL;
+    }
+
+    PyPCAP *pypcap = (PyPCAP *)PyObject_CallObject((PyObject *)&PyPCAP_Type, NULL);
+    if(NULL == pypcap) {
+        return NULL;
+    }
+
+    // connecting to a remote host can take a while
+    struct pcap_rmtauth *authp = remote_auth(&auth, username, password);
+    Py_BEGIN_ALLOW_THREADS
+        pd = pcap_open(source, snaplen, flags, read_timeout, authp, errbuf);
+    Py_END_ALLOW_THREADS
+
+    if(NULL == pd) {
+        PyErr_SetString(pypcap_error, errbuf);
+        Py_DECREF(pypcap);
+        return NULL;
+    }
+
+    // live stays 0: a file:// source is a savefile, where can_set_rfmon crashes
+    pypcap->pd = pd;
+    return pypcap;
+}
+
+
+static PyObject * pypcap_find_remote(PyObject *self, PyObject *arguments, PyObject *keywords) {
+    static char *kwlist[] = { "source", "username", "password", NULL };
+    const char *source;
+    const char *username = NULL;
+    const char *password = NULL;
+    struct pcap_rmtauth auth;
+    char errbuf[PCAP_ERRBUF_SIZE];
+    pcap_if_t *interfaces;
+    int ok;
+
+    if(FALSE == PyArg_ParseTupleAndKeywords(arguments, keywords, "s|zz", kwlist, &source, &username, &password)) {
+        return NULL;
+    }
+
+    struct pcap_rmtauth *authp = remote_auth(&auth, username, password);
+    Py_BEGIN_ALLOW_THREADS
+        ok = pcap_findalldevs_ex(source, authp, &interfaces, errbuf);
+    Py_END_ALLOW_THREADS
+
+    if(0 > ok) {
+        PyErr_SetString(pypcap_error, errbuf);
+        return NULL;
+    }
+
+    return devices_dict(interfaces, 0);
+}
+
+
+static PyObject * pypcap_createsrcstr(PyObject *self, PyObject *arguments, PyObject *keywords) {
+    static char *kwlist[] = { "type", "host", "port", "name", NULL };
+    int type;
+    const char *host = NULL;
+    const char *port = NULL;
+    const char *name = NULL;
+    char source[PCAP_BUF_SIZE];
+    char errbuf[PCAP_ERRBUF_SIZE];
+
+    if(FALSE == PyArg_ParseTupleAndKeywords(arguments, keywords, "i|zzz", kwlist, &type, &host, &port, &name)) {
+        return NULL;
+    }
+
+    if(0 > pcap_createsrcstr(source, type, host, port, name, errbuf)) {
+        PyErr_SetString(pypcap_error, errbuf);
+        return NULL;
+    }
+
+    return PyUnicode_FromString(source);
+}
+
+
+static PyObject * pypcap_parsesrcstr(PyObject *self, PyObject *source) {
+    int type;
+    char host[PCAP_BUF_SIZE];
+    char port[PCAP_BUF_SIZE];
+    char name[PCAP_BUF_SIZE];
+    char errbuf[PCAP_ERRBUF_SIZE];
+
+    const char *text = str_argument(source, "source");
+    if(NULL == text) {
+        return NULL;
+    }
+
+    if(0 > pcap_parsesrcstr(text, &type, host, port, name, errbuf)) {
+        PyErr_SetString(pypcap_error, errbuf);
+        return NULL;
+    }
+
+    // parts the source doesn't have come back empty; return them as None
+    return Py_BuildValue("(izzz)", type, host[0] ? host : NULL, port[0] ? port : NULL, name[0] ? name : NULL);
+}
+
+
+static PyObject * pypcap_setsampling(PyPCAP *self, PyObject *arguments) {
+    int method;
+    int value;
+
+    CTXCHECK
+
+    if(FALSE == PyArg_ParseTuple(arguments, "ii", &method, &value)) {
+        return NULL;
+    }
+
+    // libpcap sends these to the rpcap server when the capture starts
+    struct pcap_samp *sampling = pcap_setsampling(self->pd);
+    sampling->method = method;
+    sampling->value  = value;
+
+    Py_RETURN_NONE;
 }
 
 // Code that allows you to open a device by the name (e.g. Local Area Connection) instead of a GUID on Windows

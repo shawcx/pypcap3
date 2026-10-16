@@ -27,11 +27,16 @@ Homepage = "https://github.com/shawcx/pypcap3"
 
 [dependency-groups]
 test = ["pytest"]
+typing = ["mypy==2.4.0"]
 
 [tool.pytest.ini_options]
 testpaths = ["test"]
 
 [tool.setuptools]
-# The only module is the C extension declared in setup.py; turn off package
-# auto-discovery so setuptools doesn't treat src/ as a src-layout package dir.
-packages = []
+# Besides the C extension declared in setup.py, the only package is the PEP 561
+# stub package for type checkers. Listing it turns off package auto-discovery,
+# which would otherwise treat src/ as a src-layout package directory.
+packages = ["pypcap3-stubs"]
+
+[tool.setuptools.package-data]
+"pypcap3-stubs" = ["*.pyi"]
