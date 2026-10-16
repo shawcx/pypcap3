@@ -38,6 +38,17 @@ PyMODINIT_FUNC PyInit_pypcap3(void) {
     PyModule_AddIntConstant(mod, "D_OUT",   PCAP_D_OUT);
     PyModule_AddIntConstant(mod, "D_INOUT", PCAP_D_INOUT);
 
+    // INTERFACE FLAGS, FROM find()
+    PyModule_AddIntConstant(mod, "IF_LOOPBACK",          PCAP_IF_LOOPBACK);
+    PyModule_AddIntConstant(mod, "IF_UP",                PCAP_IF_UP);
+    PyModule_AddIntConstant(mod, "IF_RUNNING",           PCAP_IF_RUNNING);
+    PyModule_AddIntConstant(mod, "IF_WIRELESS",          PCAP_IF_WIRELESS);
+    PyModule_AddIntConstant(mod, "IF_CONNECTION_STATUS", PCAP_IF_CONNECTION_STATUS);
+    PyModule_AddIntConstant(mod, "IF_CONNECTION_STATUS_UNKNOWN",        PCAP_IF_CONNECTION_STATUS_UNKNOWN);
+    PyModule_AddIntConstant(mod, "IF_CONNECTION_STATUS_CONNECTED",      PCAP_IF_CONNECTION_STATUS_CONNECTED);
+    PyModule_AddIntConstant(mod, "IF_CONNECTION_STATUS_DISCONNECTED",   PCAP_IF_CONNECTION_STATUS_DISCONNECTED);
+    PyModule_AddIntConstant(mod, "IF_CONNECTION_STATUS_NOT_APPLICABLE", PCAP_IF_CONNECTION_STATUS_NOT_APPLICABLE);
+
     // TIMESTAMP PRECISIONS AND SOURCES
     PyModule_AddIntConstant(mod, "TSTAMP_PRECISION_MICRO",  PCAP_TSTAMP_PRECISION_MICRO);
     PyModule_AddIntConstant(mod, "TSTAMP_PRECISION_NANO",   PCAP_TSTAMP_PRECISION_NANO);
@@ -59,95 +70,144 @@ static PyObject * pypcap_version(PyObject *self) {
 }
 
 
+// text form of an IPv4 or IPv6 address, read as the given family (a netmask's
+// own sa_family isn't always set). BSDs trim trailing zero bytes from netmasks,
+// so sa_len can be 5 for 255.0.0.0; libpcap copies them at the address's size,
+// so the bytes past sa_len are whatever followed in getifaddrs()'s buffer.
+// Copy only sa_len bytes into zeroed storage so those bytes count as zero.
+static PyObject * address_string(int family, const struct sockaddr *sa) {
+    struct sockaddr_storage copy;
+    char text[INET6_ADDRSTRLEN];
+    const void *addr;
+
+    if(NULL == sa) {
+        Py_RETURN_NONE;
+    }
+
+    memset(&copy, 0, sizeof(copy));
+#ifdef SIN6_LEN
+    memcpy(&copy, sa, sa->sa_len < sizeof(copy) ? sa->sa_len : sizeof(copy));
+#else
+    memcpy(&copy, sa, AF_INET6 == family ? sizeof(struct sockaddr_in6) : sizeof(struct sockaddr_in));
+#endif // SIN6_LEN
+
+    if(AF_INET6 == family) {
+        addr = &((struct sockaddr_in6 *)&copy)->sin6_addr;
+    }
+    else {
+        addr = &((struct sockaddr_in *)&copy)->sin_addr;
+    }
+
+    if(NULL == inet_ntop(family, addr, text, sizeof(text))) {
+        Py_RETURN_NONE;
+    }
+
+    return PyUnicode_FromString(text);
+}
+
+
+// {"description", "flags", "addresses": [{"family", "addr", "netmask",
+// "broadcast", "dstaddr"}, ...]}, plus the original flat "ip", "netmask" and
+// "broadcast" keys, taken from the device's last IPv4 address
+static PyObject * describe_device(pcap_if_t *device) {
+    PyObject *entry = NULL;
+    PyObject *addresses = PyList_New(0);
+    PyObject *result = Py_BuildValue("{s:z,s:I,s:O}",
+        "description", device->description,
+        "flags",       (unsigned int)device->flags,
+        "addresses",   addresses ? addresses : Py_None);
+    if(NULL == addresses || NULL == result) {
+        goto error;
+    }
+
+    for(pcap_addr_t *address = device->addresses; address; address = address->next) {
+        if(NULL == address->addr) {
+            continue;
+        }
+        int family = address->addr->sa_family;
+        if(AF_INET != family && AF_INET6 != family) {
+            continue;
+        }
+
+        entry = Py_BuildValue("{s:i,s:N,s:N,s:N,s:N}",
+            "family",    family,
+            "addr",      address_string(family, address->addr),
+            "netmask",   address_string(family, address->netmask),
+            "broadcast", address_string(family, address->broadaddr),
+            "dstaddr",   address_string(family, address->dstaddr));
+        if(NULL == entry || 0 > PyList_Append(addresses, entry)) {
+            goto error;
+        }
+
+        if(AF_INET == family) {
+            static const char *flat[][2] = { { "addr", "ip" }, { "netmask", "netmask" }, { "broadcast", "broadcast" } };
+            for(int idx = 0; idx < 3; ++idx) {
+                PyObject *value = PyDict_GetItemString(entry, flat[idx][0]);
+                if(Py_None != value && 0 > PyDict_SetItemString(result, flat[idx][1], value)) {
+                    goto error;
+                }
+            }
+        }
+
+        Py_CLEAR(entry);
+    }
+
+    Py_DECREF(addresses);
+    return result;
+
+error:
+    Py_XDECREF(entry);
+    Py_XDECREF(addresses);
+    Py_XDECREF(result);
+    return NULL;
+}
+
+
 static PyObject * pypcap_find(PyObject *self) {
-    PyObject *name;
-    PyObject *value;
     char errbuf[PCAP_ERRBUF_SIZE];
+    pcap_if_t *interfaces;
     int ok;
 
 #ifdef WIN32
     char canonical[MAX_PATH];
 #endif // WIN32
 
-    // Returns a linked list of all interfaces in the system
-    pcap_if_t *interfaces;
     ok = pcap_findalldevs(&interfaces, errbuf);
     if(0 > ok) {
         PyErr_SetString(pypcap_error, errbuf);
         return NULL;
     }
 
-    // Create empty dictionary
-    PyObject *pyoDevDict = PyDict_New();
-
-    // Iterate through all interfaces
-    pcap_if_t *current = interfaces;
-    while(current) {
-        // Create an empty dictionary for all the addresses associated with an interface
-        PyObject *dict = PyDict_New();
-
-        // TODO: create list of addresses
-        pcap_addr_t *address = current->addresses;
-        while(address) {
-            struct sockaddr *sa = address->addr;
-            struct sockaddr_in *sai;
-            if(NULL == sa) {
-                address = address->next;
-                continue;
-            }
-
-            if(AF_INET == sa->sa_family) {
-                sai = (struct sockaddr_in *)address->addr;
-                if(NULL != sai) {
-                    value = PyUnicode_FromString(inet_ntoa(sai->sin_addr));
-                    PyDict_SetItemString(dict, "ip", value);
-                    Py_DECREF(value);
-                }
-
-                sai = (struct sockaddr_in *)address->netmask;
-                if(NULL != sai) {
-                    value = PyUnicode_FromString(inet_ntoa(sai->sin_addr));
-                    PyDict_SetItemString(dict, "netmask", value);
-                    Py_DECREF(value);
-                }
-
-                sai = (struct sockaddr_in *)address->broadaddr;
-                if(NULL != sai) {
-                    value = PyUnicode_FromString(inet_ntoa(sai->sin_addr));
-                    PyDict_SetItemString(dict, "broadcast", value);
-                    Py_DECREF(value);
-                }
-            }
-
-            if(AF_INET6 == sa->sa_family) {
-                // TODO: ipv6
-            }
-
-            address = address->next;
-        }
-
-#ifdef WIN32
-        if(0 > get_canonical(current->name + 12, canonical)) {
-            Py_DECREF(dict);
-            current = current->next;
-            continue;
-        }
-        name = PyUnicode_FromString(canonical);
-#else
-        name = PyUnicode_FromString(current->name);
-#endif // WIN32
-        PyDict_SetItem(pyoDevDict, name, dict);
-        Py_DECREF(name);
-        Py_DECREF(dict);
-
-        current = current->next;
+    PyObject *devices = PyDict_New();
+    if(NULL == devices) {
+        pcap_freealldevs(interfaces);
+        return NULL;
     }
 
-    // Free the linked list
+    for(pcap_if_t *current = interfaces; current; current = current->next) {
+#ifdef WIN32
+        // name devices by their connection name, skipping any without one
+        if(0 > get_canonical(current->name + 12, canonical)) {
+            continue;
+        }
+        const char *name = canonical;
+#else
+        const char *name = current->name;
+#endif // WIN32
+
+        PyObject *device = describe_device(current);
+        if(NULL == device || 0 > PyDict_SetItemString(devices, name, device)) {
+            Py_XDECREF(device);
+            Py_DECREF(devices);
+            pcap_freealldevs(interfaces);
+            return NULL;
+        }
+        Py_DECREF(device);
+    }
+
     pcap_freealldevs(interfaces);
 
-    // Return the dictionary of interfaces
-    return pyoDevDict;
+    return devices;
 }
 
 
@@ -278,37 +338,134 @@ static PyPCAP * pypcap_open_live(PyObject *self, PyObject *arguments) {
 }
 
 
+//
+// open_file() and dump_open() take a path (str, bytes or os.PathLike), a file
+// object with fileno(), or a descriptor such as a pipe from subprocess. A path
+// sets *path to a bytes object; otherwise *path is NULL and *fd is set.
+//
+static int parse_target(PyObject *target, PyObject **path, int *fd) {
+    *path = NULL;
+    *fd   = -1;
+
+    if(PyLong_Check(target) || PyObject_HasAttrString(target, "fileno")) {
+#ifdef WIN32
+        // the FILE would belong to a different C runtime than wpcap.dll's
+        PyErr_SetString(pypcap_error, "file objects and descriptors aren't supported on Windows; pass a path");
+        return -1;
+#else
+        PyObject *number = PyLong_Check(target) ? (Py_INCREF(target), target) : PyObject_CallMethod(target, "fileno", NULL);
+        if(NULL == number) {
+            return -1;
+        }
+        long value = PyLong_AsLong(number);
+        Py_DECREF(number);
+        if(-1 == value && PyErr_Occurred()) {
+            return -1;
+        }
+        *fd = (int)value;
+        return 0;
+#endif // WIN32
+    }
+
+    if(0 == PyUnicode_FSConverter(target, path)) {
+        if(PyErr_ExceptionMatches(PyExc_TypeError)) {
+            PyErr_SetString(pypcap_error, "expected a path, a file object or a file descriptor");
+        }
+        return -1;
+    }
+
+    return 0;
+}
+
+
+#ifndef WIN32
+// a FILE on a duplicate of fd, so closing the handle or dumper leaves the
+// caller's descriptor open. It bypasses any buffering in a Python file object.
+static FILE * dup_file(int fd, const char *mode) {
+    int copy = dup(fd);
+    if(0 > copy) {
+        PyErr_SetString(pypcap_error, strerror(errno));
+        return NULL;
+    }
+
+    FILE *fp = fdopen(copy, mode);
+    if(NULL == fp) {
+        PyErr_SetString(pypcap_error, strerror(errno));
+        close(copy);
+        return NULL;
+    }
+
+    return fp;
+}
+#endif // WIN32
+
+
 static PyPCAP * pypcap_open_file(PyObject *self, PyObject *arguments, PyObject *keywords) {
-    static char *kwlist[] = { "filename", "precision", NULL };
-    PyObject *filename;
+    static char *kwlist[] = { "file", "precision", NULL };
+    PyObject *target;
+    PyObject *path;
     int precision = PCAP_TSTAMP_PRECISION_MICRO;
+    FILE *fp = NULL;
+    pcap_t *pd;
     char errbuf[PCAP_ERRBUF_SIZE];
+    int fd;
     int ok;
 
-    ok = PyArg_ParseTupleAndKeywords(arguments, keywords, "O|i", kwlist, &filename, &precision);
+    ok = PyArg_ParseTupleAndKeywords(arguments, keywords, "O|i", kwlist, &target, &precision);
     if(FALSE == ok) {
         return NULL;
     }
 
-    ok = PyUnicode_Check(filename);
-    if(FALSE == ok) {
-        PyErr_SetString(pypcap_error, "filename must be a string");
+    if(0 > parse_target(target, &path, &fd)) {
         return NULL;
     }
+
+#ifndef WIN32
+    if(NULL == path) {
+        fp = dup_file(fd, "rb");
+        if(NULL == fp) {
+            return NULL;
+        }
+    }
+#endif // WIN32
 
     PyPCAP *pypcap = (PyPCAP *)PyObject_CallObject((PyObject *)&PyPCAP_Type, NULL);
     if(NULL == pypcap) {
+        Py_XDECREF(path);
+        if(NULL != fp) {
+            fclose(fp);
+        }
         return NULL;
     }
 
-    // libpcap scales the file's timestamps to the requested precision
-    pypcap->pd = pcap_open_offline_with_tstamp_precision(PyUnicode_AsUTF8(filename), precision, errbuf);
-    if(NULL == pypcap->pd) {
+    // Reading the file header blocks on a pipe or FIFO until the writer sends
+    // it, and the writer may be another thread here, so release the GIL.
+    // libpcap scales the file's timestamps to the requested precision.
+    const char *name = path ? PyBytes_AS_STRING(path) : NULL;
+    Py_BEGIN_ALLOW_THREADS
+#ifndef WIN32
+    if(NULL != fp) {
+        pd = pcap_fopen_offline_with_tstamp_precision(fp, precision, errbuf);
+    }
+    else
+#endif // WIN32
+    {
+        pd = pcap_open_offline_with_tstamp_precision(name, precision, errbuf);
+    }
+    Py_END_ALLOW_THREADS
+    Py_XDECREF(path);
+
+    if(NULL == pd) {
+        // on success pcap_close() closes the FILE; on failure it is still ours
+        if(NULL != fp) {
+            fclose(fp);
+        }
         PyErr_SetString(pypcap_error, errbuf);
         Py_DECREF(pypcap);
         return NULL;
     }
 
+    pypcap->pd = pd;
     return pypcap;
 }
 
@@ -1215,6 +1372,31 @@ static PyObject * pypcap_bpf_match(PyBPF *self, PyObject *packet) {
 }
 
 
+static PyObject * pypcap_bpf_instructions(PyBPF *self) {
+    PyObject *lines = PyList_New(self->program.bf_len);
+    if(NULL == lines) {
+        return NULL;
+    }
+
+    for(u_int idx = 0; idx < self->program.bf_len; ++idx) {
+        // bpf_image formats one instruction as "(000) ldh      [12]"
+        PyObject *line = PyUnicode_FromString(bpf_image(&self->program.bf_insns[idx], (int)idx));
+        if(NULL == line) {
+            Py_DECREF(lines);
+            return NULL;
+        }
+        PyList_SET_ITEM(lines, idx, line);
+    }
+
+    return lines;
+}
+
+
+static Py_ssize_t pypcap_bpf_len(PyBPF *self) {
+    return self->program.bf_len;
+}
+
+
 //
 // Capture files
 //
@@ -1224,35 +1406,66 @@ static PyObject * pypcap_bpf_match(PyBPF *self, PyObject *packet) {
 
 
 static PyObject * pypcap_dump_open(PyPCAP *self, PyObject *arguments, PyObject *keywords) {
-    static char *kwlist[] = { "path", "append", NULL };
+    static char *kwlist[] = { "file", "append", NULL };
+    PyObject *target;
     PyObject *path;
     int append = 0;
+    int fd;
     int ok;
 
     CTXCHECK
 
-    ok = PyArg_ParseTupleAndKeywords(arguments, keywords, "O&|p", kwlist, PyUnicode_FSConverter, &path, &append);
+    ok = PyArg_ParseTupleAndKeywords(arguments, keywords, "O|p", kwlist, &target, &append);
     if(FALSE == ok) {
+        return NULL;
+    }
+
+    // an unactivated handle has no link type or snaplen for the file header yet
+    int snaplen = pcap_snapshot(self->pd);
+    if(0 > snaplen) {
+        PyErr_SetString(pypcap_error, pcap_statustostr(snaplen));
+        return NULL;
+    }
+
+    if(0 > parse_target(target, &path, &fd)) {
+        return NULL;
+    }
+
+    if(append && NULL == path) {
+        PyErr_SetString(pypcap_error, "append needs a path");
         return NULL;
     }
 
     PyDumper *dumper = PyObject_New(PyDumper, &PyDumper_Type);
     if(NULL == dumper) {
-        Py_DECREF(path);
+        Py_XDECREF(path);
         return NULL;
     }
-    dumper->snaplen = pcap_snapshot(self->pd);
+    dumper->dumper  = NULL;
+    dumper->snaplen = snaplen;
     dumper->nano    = is_nano(self->pd);
     dumper->busy    = 0;
 
     // the file header takes its link type and snaplen from this handle
-    if(append) {
+    if(NULL == path) {
+#ifndef WIN32
+        FILE *fp = dup_file(fd, "wb");
+        if(NULL == fp) {
+            Py_DECREF(dumper);
+            return NULL;
+        }
+        // on failure libpcap may already have closed fp, so it isn't closed
+        // here; at worst that leaks the duplicate descriptor
+        dumper->dumper = pcap_dump_fopen(self->pd, fp);
+#endif // WIN32
+    }
+    else if(append) {
         dumper->dumper = pcap_dump_open_append(self->pd, PyBytes_AS_STRING(path));
     }
     else {
         dumper->dumper = pcap_dump_open(self->pd, PyBytes_AS_STRING(path));
     }
-    Py_DECREF(path);
+    Py_XDECREF(path);
 
     if(NULL == dumper->dumper) {
         PyErr_SetString(pypcap_error, pcap_geterr(self->pd));

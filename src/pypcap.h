@@ -10,6 +10,7 @@
 #include <time.h>
 
 #ifdef WIN32
+ #include <io.h>
  #include <ws2tcpip.h>
 #else
  #include <arpa/inet.h>
@@ -71,13 +72,14 @@ static PyObject * pypcap_lookupnet (PyObject * self, PyObject * interface);
 
 static PyMethodDef PyPCAP_methods[] = {
     { "version",      (PyCFunction)pypcap_version,   METH_NOARGS,  "return the version"                },
-    { "find",         (PyCFunction)pypcap_find,      METH_NOARGS,  "find suitable devices in a system" },
+    { "find",         (PyCFunction)pypcap_find,      METH_NOARGS,
+      "{name: {description, flags, addresses, ...}} for each capture device" },
     { "mac",          (PyCFunction)pypcap_mac,       METH_O,       "MAC address of an interface"       },
     { "open_live",    (PyCFunction)pypcap_open_live, METH_VARARGS, "open an interface"                 },
     { "open_file",    (PyCFunction)pypcap_open_file, METH_VARARGS | METH_KEYWORDS,
-      "open_file(filename, precision=TSTAMP_PRECISION_MICRO): open a capture file" },
+      "open_file(file, precision=TSTAMP_PRECISION_MICRO): read a capture from a path, file object or descriptor" },
     { "open_offline", (PyCFunction)pypcap_open_file, METH_VARARGS | METH_KEYWORDS,
-      "open_offline(filename, precision=TSTAMP_PRECISION_MICRO): open a capture file" },
+      "open_offline(file, precision=TSTAMP_PRECISION_MICRO): read a capture from a path, file object or descriptor" },
     { "create",       (PyCFunction)pypcap_create,    METH_O,       "create a live capture handle"      },
     { "open_dead",    (PyCFunction)pypcap_open_dead, METH_VARARGS | METH_KEYWORDS,
       "open_dead(linktype=1, snaplen=65535, precision=TSTAMP_PRECISION_MICRO): a handle with no device, "
@@ -179,7 +181,7 @@ static PyMethodDef PyPCAP_Type_methods[] = {
     { "compile",       (PyCFunction)pypcap_compile,        METH_VARARGS | METH_KEYWORDS,
       "compile(expression, optimize=True, netmask=None): compile a BPF expression for this handle" },
     { "dump_open",     (PyCFunction)pypcap_dump_open,      METH_VARARGS | METH_KEYWORDS,
-      "dump_open(path, append=False): open a capture file for writing packets" },
+      "dump_open(file, append=False): write packets to a path, file object or descriptor" },
 #ifdef WIN32
     { "getevent",      (PyCFunction)pypcap_getevent,       METH_NOARGS,  "get an event handle"                },
 #endif // WIN32
@@ -199,12 +201,19 @@ static PyTypeObject PyPCAP_Type = {
 };
 
 
-static void       pypcap_bpf_dealloc (PyBPF *self);
-static PyObject * pypcap_bpf_match   (PyBPF *self, PyObject *packet);
+static void       pypcap_bpf_dealloc      (PyBPF *self);
+static PyObject * pypcap_bpf_match        (PyBPF *self, PyObject *packet);
+static PyObject * pypcap_bpf_instructions (PyBPF *self);
+static Py_ssize_t pypcap_bpf_len          (PyBPF *self);
 
 static PyMethodDef PyBPF_Type_methods[] = {
-    { "match",         (PyCFunction)pypcap_bpf_match,      METH_O,       "True if the filter accepts the packet" },
+    { "match",         (PyCFunction)pypcap_bpf_match,        METH_O,       "True if the filter accepts the packet" },
+    { "instructions",  (PyCFunction)pypcap_bpf_instructions, METH_NOARGS,  "the program as text, one line per instruction, like tcpdump -d" },
     { NULL }
+};
+
+static PySequenceMethods PyBPF_Type_sequence = {
+    .sq_length    = (lenfunc)pypcap_bpf_len,
 };
 
 static PyTypeObject PyBPF_Type = {
@@ -213,6 +222,7 @@ static PyTypeObject PyBPF_Type = {
     .tp_doc       = "compiled BPF filter, from compile()",
     .tp_basicsize = sizeof(PyBPF),
     .tp_dealloc   = (destructor)pypcap_bpf_dealloc,
+    .tp_as_sequence = &PyBPF_Type_sequence,
     .tp_flags     = Py_TPFLAGS_DEFAULT,
     .tp_methods   = PyBPF_Type_methods,
 };

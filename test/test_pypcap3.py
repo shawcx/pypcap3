@@ -1,9 +1,12 @@
+import faulthandler
+import ipaddress
 import os
 import pathlib
 import select
 import signal
 import socket
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -92,8 +95,10 @@ def test_find():
     assert isinstance(devices, dict)
     for name, settings in devices.items():
         assert isinstance(name, str)
-        assert set(settings) <= {'ip', 'netmask', 'broadcast'}
-        assert all(isinstance(value, str) for value in settings.values())
+        assert {'description', 'flags', 'addresses'} <= set(settings)
+        assert set(settings) <= {'description', 'flags', 'addresses', 'ip', 'netmask', 'broadcast'}
+        for key in ('ip', 'netmask', 'broadcast'):
+            assert isinstance(settings.get(key, ''), str)
 
 
 def test_mac_requires_str():
@@ -117,9 +122,17 @@ def test_open_file_missing(tmp_path):
         pypcap3.open_file(str(tmp_path / 'missing.pcap'))
 
 
-def test_open_file_requires_str(make_pcap, packets):
-    with pytest.raises(pypcap3.error):
-        pypcap3.open_file(make_pcap(packets).encode())
+@pytest.mark.parametrize('convert', [str, str.encode, pathlib.Path], ids=['str', 'bytes', 'Path'])
+def test_open_file_path_types(make_pcap, packets, convert):
+    h = pypcap3.open_file(convert(make_pcap(packets)))
+    assert h.next() == packets[0]
+    h.close()
+
+
+@pytest.mark.parametrize('target', [None, 1.5, ['capture.pcap']])
+def test_open_file_rejects_other_types(target):
+    with pytest.raises(pypcap3.error, match='path, a file object or a file descriptor'):
+        pypcap3.open_file(target)
 
 
 def test_open_offline_alias(make_pcap, packets):
@@ -850,3 +863,153 @@ def test_only_devices_can_rfmon(handle):
     # libpcap itself crashes if asked on a file or open_dead() handle
     assert handle.can_set_rfmon() is False
     assert pypcap3.open_dead().can_set_rfmon() is False
+
+
+# find() details
+
+
+def test_find_details():
+    for name, device in pypcap3.find().items():
+        assert device['description'] is None or isinstance(device['description'], str)
+        assert isinstance(device['flags'], int)
+        for address in device['addresses']:
+            assert address['family'] in (socket.AF_INET, socket.AF_INET6)
+            for key in ('addr', 'netmask', 'broadcast', 'dstaddr'):
+                if address[key] is not None:
+                    ipaddress.ip_address(address[key])
+
+
+@pytest.mark.skipif(sys.platform == 'win32', reason='loopback interface name')
+def test_find_loopback():
+    loopback = pypcap3.find()['lo0' if sys.platform == 'darwin' else 'lo']
+    assert loopback['flags'] & pypcap3.IF_LOOPBACK
+    assert loopback['flags'] & pypcap3.IF_UP
+    ipv4 = [a for a in loopback['addresses'] if a['family'] == socket.AF_INET]
+    assert {'family': socket.AF_INET, 'addr': '127.0.0.1', 'netmask': '255.0.0.0',
+            'broadcast': None, 'dstaddr': None} in ipv4
+    # the original flat keys are still there
+    assert (loopback['ip'], loopback['netmask']) == ('127.0.0.1', '255.0.0.0')
+    for address in loopback['addresses']:
+        if address['addr'] == '::1':
+            assert address['netmask'] == 'ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff'
+
+
+# file objects, descriptors and pipes
+
+
+def test_dump_to_file_object(handle, packets, tmp_path):
+    path = tmp_path / 'object.pcap'
+    with open(path, 'wb') as f:
+        with handle.dump_open(f) as dumper:
+            handle.loop(dumper)
+        # the dumper wrote through its own copy of the descriptor, so f is still open
+        assert not f.closed
+        f.write(b'')
+    assert [record[3] for record in read_pcap(path)[2]] == packets
+
+
+def test_dump_to_descriptor_and_read_back(packets, tmp_path):
+    path = tmp_path / 'fd.pcap'
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+    with pypcap3.open_dead().dump_open(fd) as dumper:
+        for pkt in packets:
+            dumper.write(pkt, ts=1)
+    os.fstat(fd)  # still open
+    os.close(fd)
+
+    fd = os.open(path, os.O_RDONLY)
+    h = pypcap3.open_file(fd)
+    assert [h.next() for _ in packets] == packets
+    h.close()
+    os.fstat(fd)
+    os.close(fd)
+
+
+def test_read_from_file_object(make_pcap, packets):
+    with open(make_pcap(packets), 'rb') as f:
+        h = pypcap3.open_file(f, precision=pypcap3.TSTAMP_PRECISION_NANO)
+        assert h.get_tstamp_precision() == pypcap3.TSTAMP_PRECISION_NANO
+        assert [h.next() for _ in packets] == packets
+        h.close()
+        assert not f.closed
+
+
+@pytest.mark.skipif(sys.platform == 'win32', reason='file objects need POSIX descriptors')
+def test_pipe_between_dumper_and_reader(packets):
+    rfd, wfd = os.pipe()
+    with pypcap3.open_dead().dump_open(wfd) as dumper:
+        for pkt in packets:
+            dumper.write(pkt)
+    os.close(wfd)
+    h = pypcap3.open_file(rfd)
+    assert [h.next() for _ in packets] + [h.next()] == packets + [None]
+    h.close()
+    os.close(rfd)
+
+
+@pytest.mark.skipif(sys.platform == 'win32', reason='file objects need POSIX descriptors')
+def test_read_from_subprocess(make_pcap, packets):
+    # the way you would read `tcpdump -w -`
+    child = subprocess.Popen(
+        [sys.executable, '-c', 'import sys; sys.stdout.buffer.write(open(sys.argv[1], "rb").read())',
+         make_pcap(packets)],
+        stdout=subprocess.PIPE)
+    h = pypcap3.open_file(child.stdout)
+    seen = []
+    h.loop(seen.append)
+    h.close()
+    child.stdout.close()
+    assert child.wait() == 0
+    assert seen == packets
+
+
+@pytest.mark.skipif(sys.platform == 'win32', reason='needs mkfifo')
+def test_open_file_on_fifo_releases_gil(tmp_path, packets):
+    # open_file blocks until the writer thread opens the FIFO and sends the
+    # header; if it held the GIL the writer could never run. faulthandler's
+    # watchdog runs without the GIL, so a regression fails instead of hanging.
+    fifo = tmp_path / 'capture.fifo'
+    os.mkfifo(fifo)
+
+    def writer():
+        time.sleep(0.2)
+        with open(fifo, 'wb') as f:
+            f.write(pcap_bytes(packets))
+
+    thread = threading.Thread(target=writer)
+    thread.start()
+    faulthandler.dump_traceback_later(10, exit=True)
+    try:
+        h = pypcap3.open_file(str(fifo))
+        seen = []
+        h.loop(seen.append)
+        h.close()
+    finally:
+        faulthandler.cancel_dump_traceback_later()
+        thread.join()
+    assert seen == packets
+
+
+def test_append_needs_a_path(handle, tmp_path):
+    with open(tmp_path / 'append.pcap', 'wb') as f:
+        with pytest.raises(pypcap3.error, match='append needs a path'):
+            handle.dump_open(f, append=True)
+
+
+def test_bad_descriptor(handle):
+    with pytest.raises(pypcap3.error):
+        handle.dump_open(-1)
+    with pytest.raises(pypcap3.error):
+        pypcap3.open_file(-1)
+
+
+# compiled program text
+
+
+def test_instructions():
+    program = pypcap3.open_dead().compile('udp port 53')
+    lines = program.instructions()
+    assert len(program) == len(lines) > 2
+    assert lines[0] == '(000) ldh      [12]'
+    assert lines[-1].startswith(f'({len(lines) - 1:03d}) ret ')
+    assert pypcap3.open_dead().compile('').instructions() == ['(000) ret      #65535']

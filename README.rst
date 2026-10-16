@@ -25,3 +25,11 @@ Read it back with timestamps, or test a filter without a device::
 
     program = pypcap3.open_dead().compile('udp port 53')
     program.match(packet)  # True
+
+Read from a pipe, file object or descriptor, such as tcpdump's output::
+
+    import subprocess
+
+    tcpdump = subprocess.Popen(['tcpdump', '-w', '-', 'icmp'], stdout=subprocess.PIPE)
+    handle = pypcap3.open_file(tcpdump.stdout)
+    handle.loop(print, 10)

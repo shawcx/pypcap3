@@ -46,7 +46,7 @@ Two tests rely on threads and signals:
 - **`test_sigint_interrupts_blocked_loop`** and **`test_sigint_interrupts_blocked_next`** feed a pipe through `/dev/fd/N`, then send SIGINT while `loop()` or `next()` is blocked on it. If either stops releasing the GIL, its test hangs. `test_select_then_dispatch` uses the same kind of pipe.
 - **`test_loops_run_concurrently_in_threads`** uses a barrier, so it fails if two threads can't run loops at the same time.
 
-Opening a FIFO with `open_file` deadlocks such tests, because `open_file` holds the GIL while libpcap reads the header.
+`test_open_file_on_fifo_releases_gil` arms a `faulthandler` watchdog, which runs without the GIL. If `open_file()` ever holds the GIL while waiting for a FIFO's header again, the run exits after 10s instead of hanging.
 
 ## Architecture
 
@@ -58,7 +58,14 @@ Opening a FIFO with `open_file` deadlocks such tests, because `open_file` holds 
 - **Filters:**
   - `setfilter()` accepts an expression or a program from `compile()`. `bpf_program.match()` runs `pcap_offline_filter` on raw bytes.
   - Both compile against a handle's link type, so use `open_dead(linktype, snaplen)` to compile without a device.
+  - `bpf_program.instructions()` formats the program with `bpf_image`. It matches `tcpdump -d` when the snaplen and netmask match: tcpdump defaults to 262144, and `-d` compiles with netmask 0.
   - `parse_netmask` converts the dotted netmask to host byte order, because `pcap_compile` needs that for `ip broadcast` to match. `pcap_lookupnet` returns network byte order, and `lookupnet()` converts that to dotted strings, so callers never see the mismatch.
+- **Paths, file objects and descriptors:**
+  - `open_file()` and `dump_open()` go through `parse_target()`, which accepts a path (str, bytes or `os.PathLike`), an object with `fileno()`, or an int descriptor.
+  - Descriptors get `dup_file()`: a `FILE` on a `dup()` of the descriptor, so closing the handle or dumper leaves the caller's file open. This bypasses the Python file object's buffer.
+  - `open_file()` releases the GIL while libpcap reads the header, because a pipe or FIFO can block until the writer, possibly another thread, sends it.
+  - On failure, `pcap_dump_fopen` may or may not have closed the `FILE`, so `dump_open()` doesn't close it; at worst that leaks the duplicate descriptor.
+  - On Windows, only paths work: a `FILE` from the extension's C runtime can't be handed to `wpcap.dll`.
 - **Capture files:**
   - `dump_open()` returns a dumper whose file header takes the handle's link type and snaplen.
   - `write()` truncates data to that snaplen but records the full length, and timestamps default to now.
@@ -84,4 +91,8 @@ Opening a FIFO with `open_file` deadlocks such tests, because `open_file` holds 
   - `mac()` uses a `sysctl` `NET_RT_IFLIST` query on macOS, the `SIOCGIFHWADDR` ioctl on Linux, and returns `None` on Windows.
   - On Windows, `find()` returns friendly connection names and `open_live()` accepts them. The two map to `\Device\NPF_{GUID}` through registry lookups (`get_canonical` and `get_guid`).
   - `setdirection` is a no-op on Windows, and `getevent` exists only there.
-- **`find()`** returns `{ifname: {"ip", "netmask", "broadcast"}}` and reports IPv4 only; IPv6 is a TODO.
+- **`find()`:** `describe_device()` returns `{ifname: {"description", "flags", "addresses": [...]}}`. Each address has `family`, `addr`, `netmask`, `broadcast` and `dstaddr`, covering IPv4 and IPv6.
+  - `flags` is checked against the `IF_*` constants.
+  - The original flat `ip`, `netmask` and `broadcast` keys remain, taken from the last IPv4 address; `test/simple.py` relies on `ip`.
+  - `address_string()` formats each address by the address's family, not the netmask's own `sa_family`.
+  - BSD netmasks can be shorter than a full sockaddr (an `sa_len` of 5 for 255.0.0.0), so `address_string()` copies only `sa_len` bytes into zeroed storage. That path is guarded by `SIN6_LEN`, which is defined only where sockaddrs have `sa_len`.
