@@ -7,8 +7,11 @@
 #include <structmember.h>
 #include <pcap.h>
 #include <signal.h>
+#include <time.h>
 
-#ifndef WIN32
+#ifdef WIN32
+ #include <ws2tcpip.h>
+#else
  #include <arpa/inet.h>
  #include <net/if.h>
 #ifdef MACOS
@@ -18,6 +21,7 @@
  #include <netinet/in.h>
  #include <sys/ioctl.h>
  #include <sys/socket.h>
+ #include <sys/time.h>
  #include <sys/types.h>
  #include <errno.h>
 #endif
@@ -40,6 +44,18 @@ typedef struct {
     int busy;      // set while loop() or next() runs with the GIL released
 } PyPCAP;
 
+typedef struct {
+    PyObject_HEAD
+    struct bpf_program program;
+} PyBPF;
+
+typedef struct {
+    PyObject_HEAD
+    pcap_dumper_t *dumper;
+    int snaplen;   // packets longer than this are truncated, as a capture would
+    int busy;      // set while loop() writes to it with the GIL released
+} PyDumper;
+
 static PyObject * pypcap_version   (PyObject * self);
 static PyObject * pypcap_find      (PyObject * self);
 static PyObject * pypcap_mac       (PyObject * self, PyObject * interface);
@@ -47,6 +63,9 @@ static PyObject * pypcap_mac       (PyObject * self, PyObject * interface);
 static PyPCAP * pypcap_open_live (PyObject * self, PyObject * arguments);
 static PyPCAP * pypcap_open_file (PyObject * self, PyObject * filename);
 static PyPCAP * pypcap_create    (PyObject * self, PyObject * interface);
+static PyPCAP * pypcap_open_dead (PyObject * self, PyObject * arguments, PyObject * keywords);
+
+static PyObject * pypcap_lookupnet (PyObject * self, PyObject * interface);
 
 static PyMethodDef PyPCAP_methods[] = {
     { "version",      (PyCFunction)pypcap_version,   METH_NOARGS,  "return the version"                },
@@ -56,6 +75,9 @@ static PyMethodDef PyPCAP_methods[] = {
     { "open_file",    (PyCFunction)pypcap_open_file, METH_O,       "open a file"                       },
     { "open_offline", (PyCFunction)pypcap_open_file, METH_O,       "open a file"                       },
     { "create",       (PyCFunction)pypcap_create,    METH_O,       "create a live capture handle"      },
+    { "open_dead",    (PyCFunction)pypcap_open_dead, METH_VARARGS | METH_KEYWORDS,
+      "open_dead(linktype=1, snaplen=65535): a handle with no device, for compiling filters and writing files" },
+    { "lookupnet",    (PyCFunction)pypcap_lookupnet, METH_O,       "(network, netmask) of an interface" },
     { NULL }
 };
 
@@ -88,6 +110,9 @@ static PyObject * pypcap_breakloop      (PyPCAP *self);
 static PyObject * pypcap_next           (PyPCAP *self);
 static PyObject * pypcap_fileno         (PyPCAP *self);
 static PyObject * pypcap_inject         (PyPCAP *self, PyObject *packet);
+static PyObject * pypcap_setfilter      (PyPCAP *self, PyObject *arguments, PyObject *keywords);
+static PyObject * pypcap_compile        (PyPCAP *self, PyObject *arguments, PyObject *keywords);
+static PyObject * pypcap_dump_open      (PyPCAP *self, PyObject *arguments, PyObject *keywords);
 #ifdef WIN32
 static PyObject * pypcap_getevent       (PyPCAP *self);
 #endif // WIN32
@@ -105,11 +130,17 @@ static PyMethodDef PyPCAP_Type_methods[] = {
     { "setnonblock",   (PyCFunction)pypcap_setnonblock,    METH_O,       "set blocking or non-blocking"       },
     { "getnonblock",   (PyCFunction)pypcap_getnonblock,    METH_NOARGS,  "get blocking state"                 },
     { "setdirection",  (PyCFunction)pypcap_setdirection,   METH_O,       "set the direction of a capture"     },
-    { "loop",          (PyCFunction)pypcap_loop,           METH_VARARGS, "call a callback function on packet" },
+    { "loop",          (PyCFunction)pypcap_loop,           METH_VARARGS, "call a callback, or write to a dumper, for each packet" },
     { "breakloop",     (PyCFunction)pypcap_breakloop,      METH_NOARGS,  "cancel the callback function"       },
     { "next",          (PyCFunction)pypcap_next,           METH_NOARGS,  "read the next packet"               },
     { "fileno",        (PyCFunction)pypcap_fileno,         METH_NOARGS,  "fetch file descriptor"              },
     { "inject",        (PyCFunction)pypcap_inject,         METH_O,       "send a packet on the interface"     },
+    { "setfilter",     (PyCFunction)pypcap_setfilter,      METH_VARARGS | METH_KEYWORDS,
+      "setfilter(filter, optimize=True, netmask=None): apply a BPF expression or a compiled program" },
+    { "compile",       (PyCFunction)pypcap_compile,        METH_VARARGS | METH_KEYWORDS,
+      "compile(expression, optimize=True, netmask=None): compile a BPF expression for this handle" },
+    { "dump_open",     (PyCFunction)pypcap_dump_open,      METH_VARARGS | METH_KEYWORDS,
+      "dump_open(path, append=False): open a capture file for writing packets" },
 #ifdef WIN32
     { "getevent",      (PyCFunction)pypcap_getevent,       METH_NOARGS,  "get an event handle"                },
 #endif // WIN32
@@ -126,6 +157,53 @@ static PyTypeObject PyPCAP_Type = {
     .tp_dealloc   = (destructor)pypcap_dealloc,
     .tp_flags     = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE,
     .tp_methods   = PyPCAP_Type_methods,
+};
+
+
+static void       pypcap_bpf_dealloc (PyBPF *self);
+static PyObject * pypcap_bpf_match   (PyBPF *self, PyObject *packet);
+
+static PyMethodDef PyBPF_Type_methods[] = {
+    { "match",         (PyCFunction)pypcap_bpf_match,      METH_O,       "True if the filter accepts the packet" },
+    { NULL }
+};
+
+static PyTypeObject PyBPF_Type = {
+    PyVarObject_HEAD_INIT(NULL, 0)
+    .tp_name      = "pypcap3.bpf_program",
+    .tp_doc       = "compiled BPF filter, from compile()",
+    .tp_basicsize = sizeof(PyBPF),
+    .tp_dealloc   = (destructor)pypcap_bpf_dealloc,
+    .tp_flags     = Py_TPFLAGS_DEFAULT,
+    .tp_methods   = PyBPF_Type_methods,
+};
+
+
+static void       pypcap_dumper_dealloc (PyDumper *self);
+static PyObject * pypcap_dumper_write   (PyDumper *self, PyObject *arguments, PyObject *keywords);
+static PyObject * pypcap_dumper_flush   (PyDumper *self);
+static PyObject * pypcap_dumper_close   (PyDumper *self);
+static PyObject * pypcap_dumper_enter   (PyDumper *self);
+static PyObject * pypcap_dumper_exit    (PyDumper *self, PyObject *arguments);
+
+static PyMethodDef PyDumper_Type_methods[] = {
+    { "write",         (PyCFunction)pypcap_dumper_write,   METH_VARARGS | METH_KEYWORDS,
+      "write(packet, ts=None, orig_len=None): ts defaults to now, orig_len to len(packet)" },
+    { "flush",         (PyCFunction)pypcap_dumper_flush,   METH_NOARGS,  "flush buffered packets to the file" },
+    { "close",         (PyCFunction)pypcap_dumper_close,   METH_NOARGS,  "flush and close the file"           },
+    { "__enter__",     (PyCFunction)pypcap_dumper_enter,   METH_NOARGS,  NULL                                 },
+    { "__exit__",      (PyCFunction)pypcap_dumper_exit,    METH_VARARGS, NULL                                 },
+    { NULL }
+};
+
+static PyTypeObject PyDumper_Type = {
+    PyVarObject_HEAD_INIT(NULL, 0)
+    .tp_name      = "pypcap3.dumper",
+    .tp_doc       = "capture file writer, from dump_open()",
+    .tp_basicsize = sizeof(PyDumper),
+    .tp_dealloc   = (destructor)pypcap_dumper_dealloc,
+    .tp_flags     = Py_TPFLAGS_DEFAULT,
+    .tp_methods   = PyDumper_Type_methods,
 };
 
 #ifdef WIN32

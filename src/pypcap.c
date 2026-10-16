@@ -20,6 +20,12 @@ PyMODINIT_FUNC PyInit_pypcap3(void) {
     PyModule_AddObject(mod, "error", pypcap_error);
 
     ok = PyType_Ready(&PyPCAP_Type);
+    if(0 <= ok) {
+        ok = PyType_Ready(&PyBPF_Type);
+    }
+    if(0 <= ok) {
+        ok = PyType_Ready(&PyDumper_Type);
+    }
     if(0 > ok) {
         Py_DECREF(mod);
         return NULL;
@@ -307,6 +313,78 @@ static PyPCAP * pypcap_create(PyObject *self, PyObject *interface) {
     }
 
     return pypcap;
+}
+
+
+static PyPCAP * pypcap_open_dead(PyObject *self, PyObject *arguments, PyObject *keywords) {
+    static char *kwlist[] = { "linktype", "snaplen", NULL };
+    int linktype = DLT_EN10MB;
+    int snaplen  = DEFAULT_SNAPLEN;
+    int ok;
+
+    ok = PyArg_ParseTupleAndKeywords(arguments, keywords, "|ii", kwlist, &linktype, &snaplen);
+    if(FALSE == ok) {
+        return NULL;
+    }
+
+    PyPCAP *pypcap = (PyPCAP *)PyObject_CallObject((PyObject *)&PyPCAP_Type, NULL);
+    if(NULL == pypcap) {
+        return NULL;
+    }
+
+    pypcap->pd = pcap_open_dead(linktype, snaplen);
+    if(NULL == pypcap->pd) {
+        Py_DECREF(pypcap);
+        PyErr_NoMemory();
+        return NULL;
+    }
+
+    return pypcap;
+}
+
+
+static PyObject * pypcap_lookupnet(PyObject *self, PyObject *interface) {
+    bpf_u_int32 net;
+    bpf_u_int32 mask;
+    struct in_addr addr;
+    char network[INET_ADDRSTRLEN];
+    char netmask[INET_ADDRSTRLEN];
+    char errbuf[PCAP_ERRBUF_SIZE];
+    int ok;
+
+    ok = PyUnicode_Check(interface);
+    if(FALSE == ok) {
+        PyErr_SetString(pypcap_error, "interface must be a string");
+        return NULL;
+    }
+
+    const char *name = PyUnicode_AsUTF8(interface);
+    if(NULL == name) {
+        return NULL;
+    }
+
+#ifdef WIN32
+    char guid[MAX_PATH];
+    if(0 > get_guid((char *)name, guid)) {
+        PyErr_SetString(pypcap_error, "unknown interface");
+        return NULL;
+    }
+    name = guid;
+#endif // WIN32
+
+    ok = pcap_lookupnet(name, &net, &mask, errbuf);
+    if(0 > ok) {
+        PyErr_SetString(pypcap_error, errbuf);
+        return NULL;
+    }
+
+    // both come back in network byte order, ready for inet_ntop
+    addr.s_addr = net;
+    inet_ntop(AF_INET, &addr, network, sizeof(network));
+    addr.s_addr = mask;
+    inet_ntop(AF_INET, &addr, netmask, sizeof(netmask));
+
+    return Py_BuildValue("ss", network, netmask);
 }
 
 
@@ -635,13 +713,32 @@ static PyObject * pypcap_loop(PyPCAP *self, PyObject *arguments) {
         return NULL;
     }
 
-    ok = PyCallable_Check(callback);
-    if(FALSE == ok) {
-        PyErr_SetString(pypcap_error, "callback needs to be callable");
-        return NULL;
-    }
-
     loop_ctx ctx = { callback, self->pd, NULL, 0 };
+    pcap_handler handler = pypcap_handler;
+    u_char *user = (u_char *)&ctx;
+
+    // packets for a dumper go straight to pcap_dump, keeping their capture timestamps
+    PyDumper *dumper = NULL;
+    if(PyObject_TypeCheck(callback, &PyDumper_Type)) {
+        dumper = (PyDumper *)callback;
+        if(NULL == dumper->dumper) {
+            PyErr_SetString(pypcap_error, "dumper is closed");
+            return NULL;
+        }
+        if(dumper->busy) {
+            PyErr_SetString(pypcap_error, "dumper is busy in loop()");
+            return NULL;
+        }
+        handler = pcap_dump;
+        user    = (u_char *)dumper->dumper;
+    }
+    else {
+        ok = PyCallable_Check(callback);
+        if(FALSE == ok) {
+            PyErr_SetString(pypcap_error, "callback needs to be callable");
+            return NULL;
+        }
+    }
 
     int hooked = (NULL == _g_pd);
     if(hooked) {
@@ -650,10 +747,16 @@ static PyObject * pypcap_loop(PyPCAP *self, PyObject *arguments) {
     }
 
     self->busy = 1;
+    if(dumper) {
+        dumper->busy = 1;
+    }
     ctx.tstate = PyEval_SaveThread();
-    ok = pcap_loop(self->pd, cnt, pypcap_handler, (u_char *)&ctx);
+    ok = pcap_loop(self->pd, cnt, handler, user);
     PyEval_RestoreThread(ctx.tstate);
     self->busy = 0;
+    if(dumper) {
+        dumper->busy = 0;
+    }
 
     if(hooked) {
         unhook_sigint();
@@ -751,6 +854,315 @@ static PyObject * pypcap_inject(PyPCAP *self, PyObject *packet) {
     }
 
     return PyLong_FromLong(ok);
+}
+
+
+//
+// Filters
+//
+
+// pcap_compile's netmask: None means unknown, otherwise a dotted IPv4 string.
+// pcap_compile wants it in host byte order ('ip broadcast' only matches that
+// way), even though pcap_lookupnet returns network byte order.
+static int parse_netmask(PyObject *netmask, bpf_u_int32 *mask) {
+    struct in_addr addr;
+
+    if(Py_None == netmask) {
+        *mask = PCAP_NETMASK_UNKNOWN;
+        return 0;
+    }
+
+    const char *text = PyUnicode_Check(netmask) ? PyUnicode_AsUTF8(netmask) : NULL;
+    if(NULL == text || 1 != inet_pton(AF_INET, text, &addr)) {
+        PyErr_SetString(pypcap_error, "netmask must be a dotted IPv4 string or None");
+        return -1;
+    }
+
+    *mask = ntohl(addr.s_addr);
+    return 0;
+}
+
+
+static int compile_filter(PyPCAP *self, const char *expression, int optimize, PyObject *netmask, struct bpf_program *program) {
+    bpf_u_int32 mask;
+
+    if(0 > parse_netmask(netmask, &mask)) {
+        return -1;
+    }
+
+    if(0 > pcap_compile(self->pd, program, expression, optimize, mask)) {
+        PyErr_SetString(pypcap_error, pcap_geterr(self->pd));
+        return -1;
+    }
+
+    return 0;
+}
+
+
+static PyObject * pypcap_setfilter(PyPCAP *self, PyObject *arguments, PyObject *keywords) {
+    static char *kwlist[] = { "filter", "optimize", "netmask", NULL };
+    PyObject *filter;
+    int optimize = 1;
+    PyObject *netmask = Py_None;
+    struct bpf_program program;
+    int ok;
+
+    CTXCHECK
+    BUSYCHECK
+
+    ok = PyArg_ParseTupleAndKeywords(arguments, keywords, "O|pO", kwlist, &filter, &optimize, &netmask);
+    if(FALSE == ok) {
+        return NULL;
+    }
+
+    if(PyObject_TypeCheck(filter, &PyBPF_Type)) {
+        ok = pcap_setfilter(self->pd, &((PyBPF *)filter)->program);
+    }
+    else if(PyUnicode_Check(filter)) {
+        const char *expression = PyUnicode_AsUTF8(filter);
+        if(NULL == expression) {
+            return NULL;
+        }
+        if(0 > compile_filter(self, expression, optimize, netmask, &program)) {
+            return NULL;
+        }
+        // libpcap keeps its own copy, so the program can be freed straight away
+        ok = pcap_setfilter(self->pd, &program);
+        pcap_freecode(&program);
+    }
+    else {
+        PyErr_SetString(pypcap_error, "filter must be a string or a compiled program");
+        return NULL;
+    }
+
+    if(0 > ok) {
+        PyErr_SetString(pypcap_error, pcap_geterr(self->pd));
+        return NULL;
+    }
+
+    Py_RETURN_NONE;
+}
+
+
+static PyObject * pypcap_compile(PyPCAP *self, PyObject *arguments, PyObject *keywords) {
+    static char *kwlist[] = { "expression", "optimize", "netmask", NULL };
+    const char *expression;
+    int optimize = 1;
+    PyObject *netmask = Py_None;
+    int ok;
+
+    CTXCHECK
+
+    ok = PyArg_ParseTupleAndKeywords(arguments, keywords, "s|pO", kwlist, &expression, &optimize, &netmask);
+    if(FALSE == ok) {
+        return NULL;
+    }
+
+    PyBPF *bpf = PyObject_New(PyBPF, &PyBPF_Type);
+    if(NULL == bpf) {
+        return NULL;
+    }
+    bpf->program.bf_len   = 0;
+    bpf->program.bf_insns = NULL;
+
+    if(0 > compile_filter(self, expression, optimize, netmask, &bpf->program)) {
+        Py_DECREF(bpf);
+        return NULL;
+    }
+
+    return (PyObject *)bpf;
+}
+
+
+static void pypcap_bpf_dealloc(PyBPF *self) {
+    pcap_freecode(&self->program);
+    Py_TYPE(self)->tp_free((PyObject *)self);
+}
+
+
+static PyObject * pypcap_bpf_match(PyBPF *self, PyObject *packet) {
+    Py_buffer buffer;
+    struct pcap_pkthdr header;
+
+    if(0 > PyObject_GetBuffer(packet, &buffer, PyBUF_SIMPLE)) {
+        return NULL;
+    }
+
+    memset(&header, 0, sizeof(header));
+    header.caplen = (bpf_u_int32)buffer.len;
+    header.len    = (bpf_u_int32)buffer.len;
+
+    int matched = pcap_offline_filter(&self->program, &header, buffer.buf);
+    PyBuffer_Release(&buffer);
+
+    return PyBool_FromLong(matched);
+}
+
+
+//
+// Capture files
+//
+
+#define DUMPCHECK if(NULL == self->dumper) { PyErr_SetString(pypcap_error, "dumper is closed"); return NULL; }
+#define DUMPBUSYCHECK if(self->busy) { PyErr_SetString(pypcap_error, "dumper is busy in loop()"); return NULL; }
+
+
+static PyObject * pypcap_dump_open(PyPCAP *self, PyObject *arguments, PyObject *keywords) {
+    static char *kwlist[] = { "path", "append", NULL };
+    PyObject *path;
+    int append = 0;
+    int ok;
+
+    CTXCHECK
+
+    ok = PyArg_ParseTupleAndKeywords(arguments, keywords, "O&|p", kwlist, PyUnicode_FSConverter, &path, &append);
+    if(FALSE == ok) {
+        return NULL;
+    }
+
+    PyDumper *dumper = PyObject_New(PyDumper, &PyDumper_Type);
+    if(NULL == dumper) {
+        Py_DECREF(path);
+        return NULL;
+    }
+    dumper->snaplen = pcap_snapshot(self->pd);
+    dumper->busy    = 0;
+
+    // the file header takes its link type and snaplen from this handle
+    if(append) {
+        dumper->dumper = pcap_dump_open_append(self->pd, PyBytes_AS_STRING(path));
+    }
+    else {
+        dumper->dumper = pcap_dump_open(self->pd, PyBytes_AS_STRING(path));
+    }
+    Py_DECREF(path);
+
+    if(NULL == dumper->dumper) {
+        PyErr_SetString(pypcap_error, pcap_geterr(self->pd));
+        Py_DECREF(dumper);
+        return NULL;
+    }
+
+    return (PyObject *)dumper;
+}
+
+
+static void pypcap_dumper_dealloc(PyDumper *self) {
+    if(NULL != self->dumper) {
+        pcap_dump_close(self->dumper);
+        self->dumper = NULL;
+    }
+    Py_TYPE(self)->tp_free((PyObject *)self);
+}
+
+
+static void timestamp_now(struct timeval *tv) {
+#ifdef WIN32
+    struct timespec now;
+    timespec_get(&now, TIME_UTC);
+    tv->tv_sec  = (long)now.tv_sec;
+    tv->tv_usec = now.tv_nsec / 1000;
+#else
+    gettimeofday(tv, NULL);
+#endif // WIN32
+}
+
+
+static PyObject * pypcap_dumper_write(PyDumper *self, PyObject *arguments, PyObject *keywords) {
+    static char *kwlist[] = { "packet", "ts", "orig_len", NULL };
+    Py_buffer packet;
+    PyObject *ts = Py_None;
+    Py_ssize_t orig_len = -1;
+    struct pcap_pkthdr header;
+    int ok;
+
+    DUMPCHECK
+    DUMPBUSYCHECK
+
+    ok = PyArg_ParseTupleAndKeywords(arguments, keywords, "y*|On", kwlist, &packet, &ts, &orig_len);
+    if(FALSE == ok) {
+        return NULL;
+    }
+
+    if(0 <= orig_len && orig_len < packet.len) {
+        PyBuffer_Release(&packet);
+        PyErr_SetString(pypcap_error, "orig_len is shorter than the packet");
+        return NULL;
+    }
+
+    if(Py_None == ts) {
+        timestamp_now(&header.ts);
+    }
+    else {
+        double seconds = PyFloat_AsDouble(ts);
+        if(-1.0 == seconds && PyErr_Occurred()) {
+            PyBuffer_Release(&packet);
+            return NULL;
+        }
+        double whole = floor(seconds);
+        long usec = (long)((seconds - whole) * 1e6 + 0.5);
+        if(1000000 <= usec) {
+            whole += 1;
+            usec  -= 1000000;
+        }
+        header.ts.tv_sec  = (long)whole;
+        header.ts.tv_usec = usec;
+    }
+
+    // like a capture: store at most snaplen bytes, but record the full length
+    header.len    = (bpf_u_int32)(0 <= orig_len ? orig_len : packet.len);
+    header.caplen = (bpf_u_int32)(packet.len < self->snaplen ? packet.len : self->snaplen);
+
+    pcap_dump((u_char *)self->dumper, &header, packet.buf);
+    PyBuffer_Release(&packet);
+
+    Py_RETURN_NONE;
+}
+
+
+static PyObject * pypcap_dumper_flush(PyDumper *self) {
+    DUMPCHECK
+
+    if(0 > pcap_dump_flush(self->dumper)) {
+        PyErr_SetString(pypcap_error, strerror(errno));
+        return NULL;
+    }
+
+    Py_RETURN_NONE;
+}
+
+
+static PyObject * pypcap_dumper_close(PyDumper *self) {
+    DUMPBUSYCHECK
+
+    if(NULL == self->dumper) {
+        Py_RETURN_NONE;
+    }
+
+    // pcap_dump_close doesn't report errors, so flush first to catch a failed write
+    int flushed = pcap_dump_flush(self->dumper);
+    int error = errno;
+    pcap_dump_close(self->dumper);
+    self->dumper = NULL;
+
+    if(0 > flushed) {
+        PyErr_SetString(pypcap_error, strerror(error));
+        return NULL;
+    }
+
+    Py_RETURN_NONE;
+}
+
+
+static PyObject * pypcap_dumper_enter(PyDumper *self) {
+    DUMPCHECK
+    Py_INCREF(self);
+    return (PyObject *)self;
+}
+
+
+static PyObject * pypcap_dumper_exit(PyDumper *self, PyObject *arguments) {
+    return pypcap_dumper_close(self);
 }
 
 #ifdef WIN32

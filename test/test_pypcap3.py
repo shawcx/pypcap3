@@ -1,5 +1,7 @@
 import os
+import pathlib
 import signal
+import socket
 import struct
 import sys
 import threading
@@ -10,15 +12,42 @@ import pytest
 import pypcap3
 
 LINKTYPE_ETHERNET = 1
+DLT_RAW = 12
 
 
 def pcap_bytes(packets, linktype=LINKTYPE_ETHERNET, snaplen=65535):
     """A classic little-endian pcap file holding the given frames."""
     out = [struct.pack('<IHHiIII', 0xa1b2c3d4, 2, 4, 0, 0, snaplen, linktype)]
     for idx, pkt in enumerate(packets):
-        out.append(struct.pack('<IIII', 1700000000 + idx, 0, len(pkt), len(pkt)))
+        out.append(struct.pack('<IIII', 1700000000 + idx, idx * 1000 + 7, len(pkt), len(pkt)))
         out.append(pkt)
     return b''.join(out)
+
+
+def read_pcap(path):
+    """(snaplen, linktype, [(ts_sec, ts_usec, orig_len, data), ...]) from a classic pcap file."""
+    raw = pathlib.Path(path).read_bytes()
+    endian = '<' if raw[:4] == b'\xd4\xc3\xb2\xa1' else '>'
+    snaplen, linktype = struct.unpack(endian + 'II', raw[16:24])
+    records, offset = [], 24
+    while offset < len(raw):
+        sec, usec, caplen, length = struct.unpack(endian + 'IIII', raw[offset:offset + 16])
+        offset += 16
+        records.append((sec, usec, length, raw[offset:offset + caplen]))
+        offset += caplen
+    return snaplen, linktype, records
+
+
+def ipv4_udp(dport, dst='10.0.0.2', src='10.0.0.1', sport=40000, payload=b'data'):
+    """An IPv4/UDP packet with no link-layer header; checksums are left zero."""
+    udp = struct.pack('!HHHH', sport, dport, 8 + len(payload), 0) + payload
+    return struct.pack('!BBHHHBBH4s4s', 0x45, 0, 20 + len(udp), 0, 0, 64, 17, 0,
+                       socket.inet_aton(src), socket.inet_aton(dst)) + udp
+
+
+def ether(payload, ethertype=0x0800):
+    return b'\xff' * 6 + b'\x02\x00\x00\x00\x00\x01' + struct.pack('!H', ethertype) + payload
+
 
 @pytest.fixture
 def packets():
@@ -253,7 +282,8 @@ def test_loops_run_concurrently_in_threads(make_pcap, packets):
     lambda h: h.close(),
     lambda h: h.next(),
     lambda h: h.loop(print),
-], ids=['close', 'next', 'loop'])
+    lambda h: h.setfilter('udp'),
+], ids=['close', 'next', 'loop', 'setfilter'])
 def test_handle_busy_inside_loop(handle, call):
     with pytest.raises(pypcap3.error, match='busy'):
         handle.loop(lambda data: call(handle))
@@ -277,6 +307,9 @@ def test_handle_busy_inside_loop(handle, call):
     ('fileno', ()),
     ('getnonblock', ()),
     ('setnonblock', (0,)),
+    ('setfilter', ('udp',)),
+    ('compile', ('udp',)),
+    ('dump_open', ('unused.pcap',)),
 ])
 def test_closed_handle_raises(handle, method, args):
     handle.close()
@@ -335,3 +368,255 @@ def test_file_handle_rejects_live_only_calls(handle):
         handle.inject(b'\x00' * 60)
     with pytest.raises(pypcap3.error):
         handle.stats()
+
+
+# filters
+
+
+@pytest.fixture
+def mixed():
+    return [
+        ether(ipv4_udp(53)),
+        ether(ipv4_udp(80)),
+        ether(b'\x00' * 28, ethertype=0x0806),  # ARP
+        ether(ipv4_udp(53, dst='10.0.0.3')),
+        ether(ipv4_udp(123)),
+    ]
+
+
+def test_setfilter_expression(make_pcap, mixed):
+    h = pypcap3.open_file(make_pcap(mixed))
+    assert h.setfilter('udp dst port 53') is None
+    assert [h.next(), h.next(), h.next()] == [mixed[0], mixed[3], None]
+    h.close()
+
+
+def test_setfilter_compiled_program_on_two_handles(make_pcap, mixed):
+    path = make_pcap(mixed)
+    first, second = pypcap3.open_file(path), pypcap3.open_file(path)
+    program = first.compile('arp or udp port 123')
+    for h in (first, second):
+        h.setfilter(program)
+        seen = []
+        h.loop(seen.append)
+        assert seen == [mixed[2], mixed[4]]
+        h.close()
+
+
+def test_setfilter_syntax_error(handle):
+    with pytest.raises(pypcap3.error, match='syntax error'):
+        handle.setfilter('udp port')
+
+
+def test_setfilter_requires_str_or_program(handle):
+    with pytest.raises(pypcap3.error, match='string or a compiled program'):
+        handle.setfilter(53)
+
+
+def test_compile_and_match(handle, mixed):
+    program = handle.compile('udp port 53', optimize=False)
+    assert [program.match(frame) for frame in mixed] == [True, False, False, True, False]
+    assert program.match(bytearray(mixed[0])) is True
+    assert program.match(memoryview(mixed[0])) is True
+    assert program.match(b'') is False
+
+
+def test_netmask(handle):
+    with pytest.raises(pypcap3.error, match='netmask'):
+        handle.compile('ip broadcast')
+    program = handle.compile('ip broadcast', netmask='255.255.255.0')
+    assert program.match(ether(ipv4_udp(53, dst='10.0.0.255'))) is True
+    assert program.match(ether(ipv4_udp(53, dst='10.0.0.2'))) is False
+
+
+@pytest.mark.parametrize('netmask', ['255.255.255', 'nope', 0xffffff00])
+def test_invalid_netmask(handle, netmask):
+    with pytest.raises(pypcap3.error, match='dotted IPv4 string'):
+        handle.compile('udp', netmask=netmask)
+
+
+def test_compile_unactivated_handle():
+    with pytest.raises(pypcap3.error):
+        pypcap3.create('nosuch0').compile('udp')
+
+
+def test_open_dead_compiles_for_its_linktype():
+    ethernet = pypcap3.open_dead()
+    raw = pypcap3.open_dead(linktype=DLT_RAW, snaplen=1500)
+    assert ethernet.datalink() == (1, 'EN10MB', 'Ethernet')
+    assert raw.datalink()[:2] == (DLT_RAW, 'RAW')
+    assert raw.snapshot() == 1500
+    packet = ipv4_udp(53)
+    assert ethernet.compile('udp port 53').match(ether(packet)) is True
+    assert raw.compile('udp port 53').match(packet) is True
+    assert ethernet.compile('udp port 53').match(packet) is False
+
+
+def test_open_dead_has_no_packets():
+    with pytest.raises(pypcap3.error):
+        pypcap3.open_dead().next()
+
+
+@pytest.mark.skipif(sys.platform == 'win32', reason='loopback interface name')
+def test_lookupnet_loopback():
+    loopback = 'lo0' if sys.platform == 'darwin' else 'lo'
+    assert pypcap3.lookupnet(loopback) == ('127.0.0.0', '255.0.0.0')
+
+
+def test_lookupnet_errors():
+    with pytest.raises(pypcap3.error):
+        pypcap3.lookupnet('nosuch0')
+    with pytest.raises(pypcap3.error, match='must be a string'):
+        pypcap3.lookupnet(b'lo')
+
+
+# capture files
+
+
+def test_dump_roundtrip(handle, packets, tmp_path):
+    path = tmp_path / 'out.pcap'
+    dumper = handle.dump_open(path)
+    for idx, pkt in enumerate(packets):
+        dumper.write(pkt, ts=1700000000 + idx + 0.25)
+    dumper.close()
+
+    copy = pypcap3.open_file(str(path))
+    assert [copy.next() for _ in packets] + [copy.next()] == packets + [None]
+    copy.close()
+    snaplen, linktype, records = read_pcap(path)
+    assert (snaplen, linktype) == (65535, LINKTYPE_ETHERNET)
+    assert [record[:2] for record in records] == [(1700000000 + idx, 250000) for idx in range(len(packets))]
+
+
+def test_loop_into_dumper_keeps_timestamps(make_pcap, packets, tmp_path):
+    source = make_pcap(packets)
+    out = tmp_path / 'copy.pcap'
+    h = pypcap3.open_file(source)
+    with h.dump_open(out) as dumper:
+        h.loop(dumper)
+    h.close()
+    assert read_pcap(out) == read_pcap(source)
+
+
+def test_loop_into_dumper_with_filter_and_count(make_pcap, mixed, tmp_path):
+    out = tmp_path / 'dns.pcap'
+    h = pypcap3.open_file(make_pcap(mixed))
+    h.setfilter('udp port 53')
+    with h.dump_open(out) as dumper:
+        h.loop(dumper, 1)
+    h.close()
+    assert [record[3] for record in read_pcap(out)[2]] == [mixed[0]]
+
+
+@pytest.mark.parametrize('ts, expected', [
+    (1700000000.25, (1700000000, 250000)),
+    (1700000000, (1700000000, 0)),
+    (2.9999999, (3, 0)),
+])
+def test_dumper_timestamps(tmp_path, ts, expected):
+    path = tmp_path / 'ts.pcap'
+    with pypcap3.open_dead().dump_open(path) as dumper:
+        dumper.write(b'\x00' * 60, ts=ts)
+    assert read_pcap(path)[2][0][:2] == expected
+
+
+def test_dumper_default_timestamp_is_now(tmp_path):
+    path = tmp_path / 'now.pcap'
+    before = time.time()
+    with pypcap3.open_dead().dump_open(path) as dumper:
+        dumper.write(b'\x00' * 60)
+    sec, usec = read_pcap(path)[2][0][:2]
+    assert before - 1 <= sec + usec / 1e6 <= time.time() + 1
+
+
+def test_dumper_lengths(tmp_path):
+    path = tmp_path / 'lengths.pcap'
+    with pypcap3.open_dead(snaplen=64).dump_open(path) as dumper:
+        dumper.write(b'\x01' * 100)
+        dumper.write(b'\x02' * 40, orig_len=1500)
+        dumper.write(bytearray(b'\x03' * 10))
+        dumper.write(memoryview(b'\x04' * 10))
+        with pytest.raises(pypcap3.error, match='orig_len'):
+            dumper.write(b'\x05' * 40, orig_len=39)
+    assert [(length, data) for _, _, length, data in read_pcap(path)[2]] == [
+        (100, b'\x01' * 64),
+        (1500, b'\x02' * 40),
+        (10, b'\x03' * 10),
+        (10, b'\x04' * 10),
+    ]
+
+
+def test_dumper_rejects_str(tmp_path):
+    with pypcap3.open_dead().dump_open(tmp_path / 'str.pcap') as dumper:
+        with pytest.raises(TypeError):
+            dumper.write('text')
+
+
+def test_dumper_append(tmp_path):
+    path = tmp_path / 'append.pcap'
+    dead = pypcap3.open_dead()
+    with dead.dump_open(path) as dumper:
+        dumper.write(b'\x01' * 60, ts=1)
+    with dead.dump_open(path, append=True) as dumper:
+        dumper.write(b'\x02' * 60, ts=2)
+    assert [record[0] for record in read_pcap(path)[2]] == [1, 2]
+
+    with pytest.raises(pypcap3.error):
+        pypcap3.open_dead(linktype=DLT_RAW).dump_open(path, append=True)
+
+
+def test_dumper_closed(tmp_path):
+    with pypcap3.open_dead().dump_open(tmp_path / 'closed.pcap') as dumper:
+        dumper.flush()
+    dumper.close()
+    for call in (lambda: dumper.write(b'\x00'), dumper.flush, lambda: dumper.__enter__()):
+        with pytest.raises(pypcap3.error, match='dumper is closed'):
+            call()
+
+
+def test_loop_into_closed_dumper(handle, tmp_path):
+    dumper = handle.dump_open(tmp_path / 'closed.pcap')
+    dumper.close()
+    with pytest.raises(pypcap3.error, match='dumper is closed'):
+        handle.loop(dumper)
+
+
+def test_dump_open_errors(handle, tmp_path):
+    with pytest.raises(pypcap3.error):
+        handle.dump_open(tmp_path / 'missing' / 'out.pcap')
+    with pytest.raises(pypcap3.error):
+        pypcap3.create('nosuch0').dump_open(tmp_path / 'unactivated.pcap')
+
+
+@pytest.mark.skipif(sys.platform == 'win32', reason='needs /dev/fd')
+def test_dumper_busy_while_loop_writes_to_it(packets, tmp_path):
+    # loop(dumper) blocks on a pipe after the first packet; meanwhile another
+    # thread (which only runs if loop() released the GIL) can't touch the dumper
+    rfd, wfd = os.pipe()
+    os.write(wfd, pcap_bytes(packets[:1]))
+    out = tmp_path / 'busy.pcap'
+    h = pypcap3.open_file(f'/dev/fd/{rfd}')
+    dumper = h.dump_open(out)
+    errors = []
+
+    def poke():
+        time.sleep(0.2)
+        for call in (lambda: dumper.write(b'\x00' * 60), dumper.close):
+            try:
+                call()
+            except pypcap3.error as e:
+                errors.append(str(e))
+        h.breakloop()
+        os.close(wfd)  # if breakloop didn't land, EOF ends the loop instead of hanging
+
+    thread = threading.Thread(target=poke)
+    thread.start()
+    try:
+        h.loop(dumper)
+    finally:
+        thread.join()
+        os.close(rfd)
+    assert errors == ['dumper is busy in loop()'] * 2
+    dumper.close()
+    h.close()
+    assert [record[3] for record in read_pcap(out)[2]] == packets[:1]
