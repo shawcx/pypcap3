@@ -49,6 +49,7 @@ typedef struct {
 typedef struct {
     PyObject_HEAD
     struct bpf_program program;
+    int compiled;  // from pcap_compile, so pcap_freecode frees it; otherwise PyMem_Free
 } PyBPF;
 
 typedef struct {
@@ -81,6 +82,8 @@ static PyPCAP * pypcap_open_file (PyObject * self, PyObject * arguments, PyObjec
 static PyPCAP * pypcap_create    (PyObject * self, PyObject * iface);
 static PyPCAP * pypcap_open_dead (PyObject * self, PyObject * arguments, PyObject * keywords);
 
+static PyObject * pypcap_compile_dead (PyObject * self, PyObject * arguments, PyObject * keywords);
+
 static PyObject * pypcap_lookupnet (PyObject * self, PyObject * iface);
 
 static PyObject * pypcap_datalink_name_to_val        (PyObject * self, PyObject * name);
@@ -94,6 +97,10 @@ static PyPCAP *   pypcap_open_remote  (PyObject * self, PyObject * arguments, Py
 static PyObject * pypcap_find_remote  (PyObject * self, PyObject * arguments, PyObject * keywords);
 static PyObject * pypcap_createsrcstr (PyObject * self, PyObject * arguments, PyObject * keywords);
 static PyObject * pypcap_parsesrcstr  (PyObject * self, PyObject * source);
+static PyObject * pypcap_remoteact_accept  (PyObject * self, PyObject * arguments, PyObject * keywords);
+static PyObject * pypcap_remoteact_list    (PyObject * self);
+static PyObject * pypcap_remoteact_close   (PyObject * self, PyObject * host);
+static PyObject * pypcap_remoteact_cleanup (PyObject * self);
 #endif // WIN32
 
 static PyMethodDef PyPCAP_methods[] = {
@@ -110,6 +117,9 @@ static PyMethodDef PyPCAP_methods[] = {
     { "open_dead",    (PyCFunction)pypcap_open_dead, METH_VARARGS | METH_KEYWORDS,
       "open_dead(linktype=1, snaplen=65535, precision=TSTAMP_PRECISION_MICRO): a handle with no device, "
       "for compiling filters and writing files" },
+    { "compile",      (PyCFunction)pypcap_compile_dead, METH_VARARGS | METH_KEYWORDS,
+      "compile(expression, linktype=1, snaplen=65535, optimize=True, netmask=None): "
+      "compile a BPF expression without a handle" },
     { "lookupnet",    (PyCFunction)pypcap_lookupnet, METH_O,       "(network, netmask) of an interface" },
     { "datalink_name_to_val",        (PyCFunction)pypcap_datalink_name_to_val,        METH_O, "link type number for a name such as 'EN10MB'" },
     { "datalink_val_to_name",        (PyCFunction)pypcap_datalink_val_to_name,        METH_O, "name of a link type number, or None" },
@@ -126,6 +136,15 @@ static PyMethodDef PyPCAP_methods[] = {
       "createsrcstr(type, host=None, port=None, name=None): build a source string from SRC_* and its parts" },
     { "parsesrcstr",  (PyCFunction)pypcap_parsesrcstr,  METH_O,
       "(type, host, port, name) of a source string" },
+    { "remoteact_accept",  (PyCFunction)pypcap_remoteact_accept,  METH_VARARGS | METH_KEYWORDS,
+      "remoteact_accept(address=None, port=None, hostlist=None, username=None, password=None, ssl=False): "
+      "wait for an rpcapd in active mode to connect, and return its host" },
+    { "remoteact_list",    (PyCFunction)pypcap_remoteact_list,    METH_NOARGS,
+      "hosts connected through remoteact_accept()" },
+    { "remoteact_close",   (PyCFunction)pypcap_remoteact_close,   METH_O,
+      "close the active-mode connection from a host" },
+    { "remoteact_cleanup", (PyCFunction)pypcap_remoteact_cleanup, METH_NOARGS,
+      "stop a remoteact_accept() waiting in another thread" },
 #endif // WIN32
     { NULL }
 };
@@ -144,6 +163,7 @@ static void pypcap_dealloc(PyPCAP *self);
 
 static PyObject * pypcap_activate       (PyPCAP *self);
 static PyObject * pypcap_snapshot       (PyPCAP *self);
+static PyObject * pypcap_bufsize        (PyPCAP *self);
 static PyObject * pypcap_close          (PyPCAP *self);
 static PyObject * pypcap_stats          (PyPCAP *self);
 static PyObject * pypcap_geterr         (PyPCAP *self);
@@ -191,6 +211,7 @@ static PyObject * pypcap_set_protocol_linux (PyPCAP *self, PyObject *value);
 static PyObject * pypcap_getevent       (PyPCAP *self);
 static PyObject * pypcap_setbuff        (PyPCAP *self, PyObject *value);
 static PyObject * pypcap_setmintocopy   (PyPCAP *self, PyObject *value);
+static PyObject * pypcap_setuserbuffer  (PyPCAP *self, PyObject *value);
 static PyObject * pypcap_setmode        (PyPCAP *self, PyObject *value);
 static PyObject * pypcap_stats_ex       (PyPCAP *self);
 static PyObject * pypcap_oid_get_request(PyPCAP *self, PyObject *arguments);
@@ -202,6 +223,7 @@ static PyObject * pypcap_setsampling    (PyPCAP *self, PyObject *arguments);
 static PyMethodDef PyPCAP_Type_methods[] = {
     { "activate",      (PyCFunction)pypcap_activate,       METH_NOARGS,  "activate an interface"              },
     { "snapshot",      (PyCFunction)pypcap_snapshot,       METH_NOARGS,  "get the snaplen"                    },
+    { "bufsize",       (PyCFunction)pypcap_bufsize,        METH_NOARGS,  "size of the capture buffer in bytes" },
     { "close",         (PyCFunction)pypcap_close,          METH_NOARGS,  "close an interface"                 },
     { "stats",         (PyCFunction)pypcap_stats,          METH_NOARGS,  "get stats from a sessions"          },
     { "geterr",        (PyCFunction)pypcap_geterr,         METH_NOARGS,  "print the last error"               },
@@ -259,6 +281,7 @@ static PyMethodDef PyPCAP_Type_methods[] = {
     { "getevent",      (PyCFunction)pypcap_getevent,       METH_NOARGS,  "get an event handle"                },
     { "setbuff",       (PyCFunction)pypcap_setbuff,        METH_O,       "set the driver buffer size in bytes" },
     { "setmintocopy",  (PyCFunction)pypcap_setmintocopy,   METH_O,       "bytes the driver waits for before a read returns" },
+    { "setuserbuffer", (PyCFunction)pypcap_setuserbuffer,  METH_O,       "size in bytes of the buffer packets are read into" },
     { "setmode",       (PyCFunction)pypcap_setmode,        METH_O,       "MODE_CAPT or MODE_STAT"             },
     { "stats_ex",      (PyCFunction)pypcap_stats_ex,       METH_NOARGS,  "stats() plus Npcap's capt, sent and netdrop counters" },
     { "oid_get_request", (PyCFunction)pypcap_oid_get_request, METH_VARARGS, "oid_get_request(oid, size): query an adapter OID" },
@@ -306,10 +329,12 @@ static PyTypeObject PyPacketIter_Type = {
 };
 
 
+static PyObject * pypcap_bpf_new          (PyTypeObject *type, PyObject *arguments, PyObject *keywords);
 static void       pypcap_bpf_dealloc      (PyBPF *self);
 static PyObject * pypcap_bpf_match        (PyBPF *self, PyObject *packet);
 static PyObject * pypcap_bpf_instructions (PyBPF *self);
 static Py_ssize_t pypcap_bpf_len          (PyBPF *self);
+static PyObject * pypcap_bpf_item         (PyBPF *self, Py_ssize_t index);
 
 static PyMethodDef PyBPF_Type_methods[] = {
     { "match",         (PyCFunction)pypcap_bpf_match,        METH_O,       "True if the filter accepts the packet" },
@@ -319,16 +344,20 @@ static PyMethodDef PyBPF_Type_methods[] = {
 
 static PySequenceMethods PyBPF_Type_sequence = {
     .sq_length    = (lenfunc)pypcap_bpf_len,
+    .sq_item      = (ssizeargfunc)pypcap_bpf_item,
 };
 
 static PyTypeObject PyBPF_Type = {
     PyVarObject_HEAD_INIT(NULL, 0)
     .tp_name      = "pypcap3.bpf_program",
-    .tp_doc       = "compiled BPF filter, from compile()",
+    .tp_doc       = "BPF filter, from compile() or bpf_program(instructions), "
+                    "a sequence of (code, jt, jf, k) tuples as tcpdump -ddd prints them",
     .tp_basicsize = sizeof(PyBPF),
+    .tp_new       = pypcap_bpf_new,
     .tp_dealloc   = (destructor)pypcap_bpf_dealloc,
     .tp_as_sequence = &PyBPF_Type_sequence,
     .tp_flags     = Py_TPFLAGS_DEFAULT,
+    .tp_iter      = PySeqIter_New,
     .tp_methods   = PyBPF_Type_methods,
 };
 

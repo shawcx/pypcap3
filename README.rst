@@ -22,8 +22,9 @@ Read it back with timestamps, or test a filter without a device::
         for packet, ts, orig_len in handle.packets(header=True):
             print(ts, orig_len)
 
-    program = pypcap3.open_dead().compile('udp port 53')
+    program = pypcap3.compile('udp port 53')  # for Ethernet, unless linktype= says otherwise
     program.match(packet)  # True
+    list(program)          # [(40, 0, 0, 12), ...], the instructions as tcpdump -ddd prints them
 
 Read from a pipe, file object or descriptor, such as tcpdump's output::
 

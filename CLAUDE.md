@@ -63,22 +63,24 @@ Two tests rely on threads and signals:
 - **`src/pypcap.h` holds the Python-facing surface:** every function prototype, the `PyMethodDef` tables, the `PyModuleDef`, the type objects, and the defaults (`DEFAULT_SNAPLEN`, `DEFAULT_PROMISC`, `DEFAULT_TO_MS`). `src/pypcap.c` holds only the implementations. Adding a method means adding a prototype and a table entry in the header plus the body in the `.c` file.
 - **Types:** the module exposes its types as `handle`, `bpf_program`, `dumper`, `packet_iterator` and, on Windows, `sendqueue`, for `isinstance()` and type hints.
   - Only `handle` can be subclassed, and calling `handle()` gives an unopened handle. Real handles come from `open_live`, `open_file`/`open_offline`, `create` or `open_dead` (and `open_remote` on Windows).
-  - `sendqueue(memsize)` is constructed directly. The other types can't be.
+  - `bpf_program(instructions)` and `sendqueue(memsize)` are constructed directly. `dumper` and `packet_iterator` can't be.
 - **Handles:** import calls `pcap_init(PCAP_CHAR_ENC_UTF_8)`, so libpcap takes and returns UTF-8 strings on Windows too. Each handle wraps one `pcap_t *pd`, and `live` marks handles from `open_live()` or `create()`. Handle methods start with the `CTXCHECK` macro, which raises if `pd` is NULL (for example after `close()`). Any new method that touches `pd` needs it too, or it crashes on a closed handle.
 - **Busy handles:** `loop()`, `dispatch()` and `next()` set `self->busy` while the GIL is released.
   - The `BUSYCHECK` macro makes `close()`, `loop()`, `dispatch()`, `next()` and `setfilter()` raise while it is set, so the `pcap_t` can't be closed, re-entered or refiltered from another thread or from inside the callback.
   - `breakloop()` is deliberately not guarded.
 - **Filters:**
-  - `setfilter()` accepts an expression or a program from `compile()`. `bpf_program.match()` runs `pcap_offline_filter` on raw bytes.
-  - Both compile against a handle's link type, so use `open_dead(linktype, snaplen)` to compile without a device.
+  - `setfilter()` accepts an expression or a `bpf_program`. `bpf_program.match()` runs `pcap_offline_filter` on raw bytes.
+  - `handle.compile()` and `setfilter()` compile against the handle's link type. The module's `compile(expression, linktype, snaplen, ...)` compiles without a device through a temporary `pcap_open_dead` handle. It doesn't call `pcap_compile_nopcap`, which does the same but loses libpcap's error text.
+  - A `bpf_program` is a sequence of `(code, jt, jf, k)` tuples, the numbers `tcpdump -ddd` prints. `bpf_program(instructions)` builds one from such tuples, and `bpf_validate` checks it.
+    - `compiled` records who allocated the instructions. `pcap_freecode` frees compiled programs, and `PyMem_Free` frees built ones, because on Windows `wpcap.dll` may free with another C runtime.
   - `bpf_program.instructions()` formats the program with `bpf_image`. It matches `tcpdump -d` when the snaplen and netmask match: tcpdump defaults to 262144, and `-d` compiles with netmask 0.
   - `parse_netmask` converts the dotted netmask to host byte order, because `pcap_compile` needs that for `ip broadcast` to match. `pcap_lookupnet` returns network byte order, and `lookupnet()` converts that to dotted strings, so callers never see the mismatch.
 - **Paths, file objects and descriptors:**
   - `open_file()` and `dump_open()` go through `parse_target()`, which accepts a path (str, bytes or `os.PathLike`), an object with `fileno()`, or an int descriptor.
   - Descriptors get `dup_file()`: a `FILE` on a `dup()` of the descriptor, so closing the handle or dumper leaves the caller's file open. This bypasses the Python file object's buffer.
+  - On Windows, a `FILE` from the extension's C runtime can't be handed to `wpcap.dll`, but a Windows handle can. So `dup_handle()` takes the descriptor's handle with `_get_osfhandle`, silencing the C runtime's invalid-parameter handler so that a bad descriptor raises instead of ending the process. It then makes a `DuplicateHandle` copy for `pcap_hopen_offline_with_tstamp_precision` or `pcap_dump_hopen`. This has been compiled but never run.
   - `open_file()` releases the GIL while libpcap reads the header, because a pipe or FIFO can block until the writer, possibly another thread, sends it.
-  - On failure, `pcap_dump_fopen` may or may not have closed the `FILE`, so `dump_open()` doesn't close it; at worst that leaks the duplicate descriptor.
-  - On Windows, only paths work: a `FILE` from the extension's C runtime can't be handed to `wpcap.dll`.
+  - On failure, `pcap_dump_fopen` may or may not have closed the `FILE`, so `dump_open()` doesn't close it; at worst that leaks the duplicate descriptor. The same goes for the duplicate handle on Windows, in both `dump_open()` and `open_file()`.
 - **Capture files:**
   - `dump_open()` returns a dumper whose file header takes the handle's link type and snaplen.
   - `write()` truncates data to that snaplen but records the full length, and timestamps default to now.
@@ -115,8 +117,14 @@ Two tests rely on threads and signals:
   - On Windows, `find()` returns friendly connection names and `open_live()` accepts them. The two map to `\Device\NPF_{GUID}` through registry lookups (`get_canonical` and `get_guid`).
   - `setdirection` is a no-op on Windows, and `getevent` exists only there.
   - Npcap-only methods:
-    - `setbuff`, `setmintocopy`, `setmode` (`MODE_*`), `stats_ex`, `oid_get_request`/`oid_set_request` and `sendqueue_transmit`.
-    - Passive-mode rpcap: `open_remote`, `find_remote`, `createsrcstr`/`parsesrcstr` and `setsampling` (`SRC_*`, `OPENFLAG_*`, `SAMP_*`). Active mode (`pcap_remoteact_*`) isn't wrapped.
+    - `setbuff`, `setmintocopy`, `setuserbuffer`, `setmode` (`MODE_*`), `stats_ex`, `oid_get_request`/`oid_set_request` and `sendqueue_transmit`. `setuserbuffer` frees the buffer a running loop reads into, so it takes `BUSYCHECK`.
+    - Passive-mode rpcap: `open_remote`, `find_remote`, `createsrcstr`/`parsesrcstr` and `setsampling` (`SRC_*`, `OPENFLAG_*`, `SAMP_*`).
+    - Active-mode rpcap, where `rpcapd -a` connects to us:
+      - `remoteact_accept()` releases the GIL and blocks until an rpcapd connects, then returns its host. After that, `open_remote()` and `find_remote()` reach the host through libpcap's kept connection with `rpcap://<host>/` sources.
+      - `remoteact_cleanup()` closes the listening socket, which stops a `remoteact_accept()` waiting in another thread. Ctrl-C doesn't.
+      - libpcap keeps one global listening socket, so `_g_accepting` allows one `remoteact_accept()` at a time.
+      - libpcap keeps the hosts in an unlocked global list. `remoteact_list()` and `remoteact_close()` keep the GIL, so only the accept itself can race with them.
+      - `remoteact_list()` passes a `PCAP_ERRBUF_SIZE` buffer, because libpcap appends with that limit whatever size it gets. A bigger buffer would come back garbled past 255 characters.
     - `open_remote` handles aren't `live`, because a `file://` source is a savefile.
     - All of these are compiled in CI but have never been run.
   - Npcap marks `pcap_fileno` deprecated "until a `pcap_handle` exists". It doesn't exist yet, so `fileno()` keeps calling `pcap_fileno`.

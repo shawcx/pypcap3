@@ -408,11 +408,6 @@ static int parse_target(PyObject *target, PyObject **path, int *fd) {
     *fd   = -1;
 
     if(PyLong_Check(target) || PyObject_HasAttrString(target, "fileno")) {
-#ifdef WIN32
-        // the FILE would belong to a different C runtime than wpcap.dll's
-        PyErr_SetString(pypcap_error, "file objects and descriptors aren't supported on Windows; pass a path");
-        return -1;
-#else
         PyObject *number = PyLong_Check(target) ? (Py_INCREF(target), target) : PyObject_CallMethod(target, "fileno", NULL);
         if(NULL == number) {
             return -1;
@@ -424,7 +419,6 @@ static int parse_target(PyObject *target, PyObject **path, int *fd) {
         }
         *fd = (int)value;
         return 0;
-#endif // WIN32
     }
 
     if(0 == PyUnicode_FSConverter(target, path)) {
@@ -438,7 +432,38 @@ static int parse_target(PyObject *target, PyObject **path, int *fd) {
 }
 
 
-#ifndef WIN32
+#ifdef WIN32
+static void ignore_invalid_parameter(const wchar_t *expression, const wchar_t *function, const wchar_t *file, unsigned int line, uintptr_t reserved) {
+}
+
+
+// A duplicate of fd's Windows handle, for pcap_hopen_offline and
+// pcap_dump_hopen. A FILE from this extension's C runtime can't be handed to
+// wpcap.dll, which may use another, but a handle can. libpcap closes the
+// duplicate, which leaves the caller's descriptor open.
+static int dup_handle(int fd, intptr_t *copy) {
+    // the C runtime's default handler would end the process on a bad descriptor
+    _invalid_parameter_handler previous = _set_thread_local_invalid_parameter_handler(ignore_invalid_parameter);
+    intptr_t handle = _get_osfhandle(fd);
+    _set_thread_local_invalid_parameter_handler(previous);
+
+    // -2 means a standard stream with no console behind it
+    if(-1 == handle || -2 == handle) {
+        PyErr_SetString(pypcap_error, strerror(EBADF));
+        return -1;
+    }
+
+    HANDLE process = GetCurrentProcess();
+    HANDLE duplicate;
+    if(!DuplicateHandle(process, (HANDLE)handle, process, &duplicate, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+        PyErr_Format(pypcap_error, "DuplicateHandle failed with error %lu", GetLastError());
+        return -1;
+    }
+
+    *copy = (intptr_t)duplicate;
+    return 0;
+}
+#else
 // a FILE on a duplicate of fd, so closing the handle or dumper leaves the
 // caller's descriptor open. It bypasses any buffering in a Python file object.
 static FILE * dup_file(int fd, const char *mode) {
@@ -465,7 +490,11 @@ static PyPCAP * pypcap_open_file(PyObject *self, PyObject *arguments, PyObject *
     PyObject *target;
     PyObject *path;
     int precision = PCAP_TSTAMP_PRECISION_MICRO;
+#ifdef WIN32
+    intptr_t osfd = -1;
+#else
     FILE *fp = NULL;
+#endif // WIN32
     pcap_t *pd;
     char errbuf[PCAP_ERRBUF_SIZE];
     int fd;
@@ -480,21 +509,31 @@ static PyPCAP * pypcap_open_file(PyObject *self, PyObject *arguments, PyObject *
         return NULL;
     }
 
-#ifndef WIN32
     if(NULL == path) {
+#ifdef WIN32
+        if(0 > dup_handle(fd, &osfd)) {
+            return NULL;
+        }
+#else
         fp = dup_file(fd, "rb");
         if(NULL == fp) {
             return NULL;
         }
-    }
 #endif // WIN32
+    }
 
     PyPCAP *pypcap = (PyPCAP *)PyObject_CallObject((PyObject *)&PyPCAP_Type, NULL);
     if(NULL == pypcap) {
         Py_XDECREF(path);
+#ifdef WIN32
+        if(-1 != osfd) {
+            CloseHandle((HANDLE)osfd);
+        }
+#else
         if(NULL != fp) {
             fclose(fp);
         }
+#endif // WIN32
         return NULL;
     }
 
@@ -503,23 +542,28 @@ static PyPCAP * pypcap_open_file(PyObject *self, PyObject *arguments, PyObject *
     // libpcap scales the file's timestamps to the requested precision.
     const char *name = path ? PyBytes_AS_STRING(path) : NULL;
     Py_BEGIN_ALLOW_THREADS
-#ifndef WIN32
-    if(NULL != fp) {
-        pd = pcap_fopen_offline_with_tstamp_precision(fp, precision, errbuf);
-    }
-    else
-#endif // WIN32
-    {
+    if(NULL != name) {
         pd = pcap_open_offline_with_tstamp_precision(name, precision, errbuf);
+    }
+    else {
+#ifdef WIN32
+        pd = pcap_hopen_offline_with_tstamp_precision(osfd, precision, errbuf);
+#else
+        pd = pcap_fopen_offline_with_tstamp_precision(fp, precision, errbuf);
+#endif // WIN32
     }
     Py_END_ALLOW_THREADS
     Py_XDECREF(path);
 
     if(NULL == pd) {
-        // on success pcap_close() closes the FILE; on failure it is still ours
+        // On success pcap_close() closes the FILE; on failure it is still
+        // ours. On Windows, wpcap.dll may already have wrapped the handle in a
+        // FILE of its own, so it isn't closed: at worst that leaks it.
+#ifndef WIN32
         if(NULL != fp) {
             fclose(fp);
         }
+#endif // WIN32
         PyErr_SetString(pypcap_error, errbuf);
         Py_DECREF(pypcap);
         return NULL;
@@ -772,6 +816,17 @@ static PyObject * pypcap_snapshot(PyPCAP *self) {
         return NULL;
     }
     return PyLong_FromLong(snaplen);
+}
+
+
+static PyObject * pypcap_bufsize(PyPCAP *self) {
+    CTXCHECK
+    int size = pcap_bufsize(self->pd);
+    if(0 > size) {
+        PyErr_SetString(pypcap_error, pcap_statustostr(size));
+        return NULL;
+    }
+    return PyLong_FromLong(size);
 }
 
 
@@ -1585,19 +1640,47 @@ static int parse_netmask(PyObject *netmask, bpf_u_int32 *mask) {
 }
 
 
-static int compile_filter(PyPCAP *self, const char *expression, int optimize, PyObject *netmask, struct bpf_program *program) {
+static int compile_filter(pcap_t *pd, const char *expression, int optimize, PyObject *netmask, struct bpf_program *program) {
     bpf_u_int32 mask;
 
     if(0 > parse_netmask(netmask, &mask)) {
         return -1;
     }
 
-    if(0 > pcap_compile(self->pd, program, expression, optimize, mask)) {
-        PyErr_SetString(pypcap_error, pcap_geterr(self->pd));
+    if(0 > pcap_compile(pd, program, expression, optimize, mask)) {
+        PyErr_SetString(pypcap_error, pcap_geterr(pd));
         return -1;
     }
 
     return 0;
+}
+
+
+static PyBPF * new_bpf(int compiled) {
+    PyBPF *bpf = PyObject_New(PyBPF, &PyBPF_Type);
+    if(NULL == bpf) {
+        return NULL;
+    }
+    bpf->program.bf_len   = 0;
+    bpf->program.bf_insns = NULL;
+    bpf->compiled         = compiled;
+    return bpf;
+}
+
+
+// a bpf_program for pd's link type and snaplen
+static PyObject * compiled_program(pcap_t *pd, const char *expression, int optimize, PyObject *netmask) {
+    PyBPF *bpf = new_bpf(1);
+    if(NULL == bpf) {
+        return NULL;
+    }
+
+    if(0 > compile_filter(pd, expression, optimize, netmask, &bpf->program)) {
+        Py_DECREF(bpf);
+        return NULL;
+    }
+
+    return (PyObject *)bpf;
 }
 
 
@@ -1625,7 +1708,7 @@ static PyObject * pypcap_setfilter(PyPCAP *self, PyObject *arguments, PyObject *
         if(NULL == expression) {
             return NULL;
         }
-        if(0 > compile_filter(self, expression, optimize, netmask, &program)) {
+        if(0 > compile_filter(self->pd, expression, optimize, netmask, &program)) {
             return NULL;
         }
         // libpcap keeps its own copy, so the program can be freed straight away
@@ -1660,14 +1743,123 @@ static PyObject * pypcap_compile(PyPCAP *self, PyObject *arguments, PyObject *ke
         return NULL;
     }
 
-    PyBPF *bpf = PyObject_New(PyBPF, &PyBPF_Type);
-    if(NULL == bpf) {
+    return compiled_program(self->pd, expression, optimize, netmask);
+}
+
+
+// The module's compile(), through a temporary open_dead() handle. Unlike
+// pcap_compile_nopcap, which does the same, this keeps libpcap's error text.
+static PyObject * pypcap_compile_dead(PyObject *self, PyObject *arguments, PyObject *keywords) {
+    static char *kwlist[] = { "expression", "linktype", "snaplen", "optimize", "netmask", NULL };
+    const char *expression;
+    int linktype = DLT_EN10MB;
+    int snaplen  = DEFAULT_SNAPLEN;
+    int optimize = 1;
+    PyObject *netmask = Py_None;
+    int ok;
+
+    ok = PyArg_ParseTupleAndKeywords(arguments, keywords, "s|iipO", kwlist, &expression, &linktype, &snaplen, &optimize, &netmask);
+    if(FALSE == ok) {
         return NULL;
     }
-    bpf->program.bf_len   = 0;
-    bpf->program.bf_insns = NULL;
 
-    if(0 > compile_filter(self, expression, optimize, netmask, &bpf->program)) {
+    pcap_t *pd = pcap_open_dead(linktype, snaplen);
+    if(NULL == pd) {
+        return PyErr_NoMemory();
+    }
+
+    PyObject *program = compiled_program(pd, expression, optimize, netmask);
+    pcap_close(pd);
+    return program;
+}
+
+
+// one (code, jt, jf, k) instruction, as a tuple or list; -1 if it isn't one
+static int parse_insn(PyObject *item, struct bpf_insn *insn) {
+    static const unsigned long long limits[4] = { 0xffff, 0xff, 0xff, 0xffffffff };
+    unsigned long long fields[4];
+
+    if(!(PyTuple_Check(item) || PyList_Check(item)) || 4 != PySequence_Fast_GET_SIZE(item)) {
+        return -1;
+    }
+
+    for(int idx = 0; idx < 4; ++idx) {
+        PyObject *field = PySequence_Fast_GET_ITEM(item, idx);
+        if(!PyLong_Check(field)) {
+            return -1;
+        }
+        fields[idx] = PyLong_AsUnsignedLongLong(field);
+        if((unsigned long long)-1 == fields[idx] && PyErr_Occurred()) {
+            // OverflowError, for a negative or huge number
+            PyErr_Clear();
+            return -1;
+        }
+        if(fields[idx] > limits[idx]) {
+            return -1;
+        }
+    }
+
+    insn->code = (u_short)fields[0];
+    insn->jt   = (u_char)fields[1];
+    insn->jf   = (u_char)fields[2];
+    insn->k    = (bpf_u_int32)fields[3];
+    return 0;
+}
+
+
+// bpf_program(instructions): a program from (code, jt, jf, k) tuples, such as
+// list(program) or the lines of tcpdump -ddd, checked with bpf_validate
+static PyObject * pypcap_bpf_new(PyTypeObject *type, PyObject *arguments, PyObject *keywords) {
+    static char *kwlist[] = { "instructions", NULL };
+    PyObject *instructions;
+    int ok;
+
+    ok = PyArg_ParseTupleAndKeywords(arguments, keywords, "O", kwlist, &instructions);
+    if(FALSE == ok) {
+        return NULL;
+    }
+
+    PyObject *items = PySequence_Fast(instructions, "instructions must be an iterable of (code, jt, jf, k) tuples");
+    if(NULL == items) {
+        return NULL;
+    }
+
+    Py_ssize_t count = PySequence_Fast_GET_SIZE(items);
+    if(count > INT_MAX) {
+        Py_DECREF(items);
+        PyErr_SetString(pypcap_error, "too many instructions");
+        return NULL;
+    }
+
+    PyBPF *bpf = new_bpf(0);
+    if(NULL == bpf) {
+        Py_DECREF(items);
+        return NULL;
+    }
+
+    // PyMem_New(0) still returns a pointer, so an empty program fails below
+    bpf->program.bf_insns = PyMem_New(struct bpf_insn, count);
+    if(NULL == bpf->program.bf_insns) {
+        Py_DECREF(items);
+        Py_DECREF(bpf);
+        return PyErr_NoMemory();
+    }
+    bpf->program.bf_len = (u_int)count;
+
+    for(Py_ssize_t idx = 0; idx < count; ++idx) {
+        if(0 > parse_insn(PySequence_Fast_GET_ITEM(items, idx), &bpf->program.bf_insns[idx])) {
+            PyErr_Format(pypcap_error, "instruction %zd must be (code, jt, jf, k), with code below 65536, "
+                         "jt and jf below 256, and k below 2**32", idx);
+            Py_DECREF(items);
+            Py_DECREF(bpf);
+            return NULL;
+        }
+    }
+    Py_DECREF(items);
+
+    if(!bpf_validate(bpf->program.bf_insns, (int)count)) {
+        PyErr_SetString(pypcap_error, "invalid BPF program: it needs known opcodes, "
+                        "jumps that stay inside it, and a return at the end");
         Py_DECREF(bpf);
         return NULL;
     }
@@ -1677,7 +1869,14 @@ static PyObject * pypcap_compile(PyPCAP *self, PyObject *arguments, PyObject *ke
 
 
 static void pypcap_bpf_dealloc(PyBPF *self) {
-    pcap_freecode(&self->program);
+    // libpcap frees what pcap_compile allocated. A program built from tuples
+    // is ours, and on Windows wpcap.dll may free with another C runtime.
+    if(self->compiled) {
+        pcap_freecode(&self->program);
+    }
+    else {
+        PyMem_Free(self->program.bf_insns);
+    }
     Py_TYPE(self)->tp_free((PyObject *)self);
 }
 
@@ -1723,6 +1922,18 @@ static PyObject * pypcap_bpf_instructions(PyBPF *self) {
 
 static Py_ssize_t pypcap_bpf_len(PyBPF *self) {
     return self->program.bf_len;
+}
+
+
+// program[index] is (code, jt, jf, k), as tcpdump -ddd prints it
+static PyObject * pypcap_bpf_item(PyBPF *self, Py_ssize_t index) {
+    if(0 > index || index >= (Py_ssize_t)self->program.bf_len) {
+        PyErr_SetString(PyExc_IndexError, "instruction index out of range");
+        return NULL;
+    }
+
+    const struct bpf_insn *insn = &self->program.bf_insns[index];
+    return Py_BuildValue("(HBBI)", insn->code, insn->jt, insn->jf, insn->k);
 }
 
 
@@ -1777,14 +1988,21 @@ static PyObject * pypcap_dump_open(PyPCAP *self, PyObject *arguments, PyObject *
 
     // the file header takes its link type and snaplen from this handle
     if(NULL == path) {
-#ifndef WIN32
+        // on failure libpcap may already have closed the duplicate, so it
+        // isn't closed here; at worst that leaks it
+#ifdef WIN32
+        intptr_t osfd;
+        if(0 > dup_handle(fd, &osfd)) {
+            Py_DECREF(dumper);
+            return NULL;
+        }
+        dumper->dumper = pcap_dump_hopen(self->pd, osfd);
+#else
         FILE *fp = dup_file(fd, "wb");
         if(NULL == fp) {
             Py_DECREF(dumper);
             return NULL;
         }
-        // on failure libpcap may already have closed fp, so it isn't closed
-        // here; at worst that leaks the duplicate descriptor
         dumper->dumper = pcap_dump_fopen(self->pd, fp);
 #endif // WIN32
     }
@@ -1982,6 +2200,14 @@ static PyObject * pypcap_setbuff(PyPCAP *self, PyObject *value) {
 
 static PyObject * pypcap_setmintocopy(PyPCAP *self, PyObject *value) {
     return set_option(self, value, pcap_setmintocopy, "minimum to copy");
+}
+
+
+static PyObject * pypcap_setuserbuffer(PyPCAP *self, PyObject *value) {
+    CTXCHECK
+    // it frees the buffer that a running loop() reads packets from
+    BUSYCHECK
+    return set_option(self, value, pcap_setuserbuffer, "user buffer size");
 }
 
 
@@ -2296,6 +2522,124 @@ static PyObject * pypcap_parsesrcstr(PyObject *self, PyObject *source) {
 
     // parts the source doesn't have come back empty; return them as None
     return Py_BuildValue("(izzz)", type, host[0] ? host : NULL, port[0] ? port : NULL, name[0] ? name : NULL);
+}
+
+
+//
+// rpcap active mode: an `rpcapd -a` connects to us rather than the other way
+// round. remoteact_accept() waits for one connection, and libpcap keeps it,
+// so open_remote() and find_remote() then reach that host through it with
+// sources such as rpcap://<host>/. libpcap keeps these hosts in a global list
+// without a lock; holding the GIL serializes everything but the accept itself.
+//
+static int _g_accepting = 0;         // a remoteact_accept() waits with the GIL released
+static int _g_accept_cancelled = 0;  // and remoteact_cleanup() has been called for it
+
+
+static PyObject * pypcap_remoteact_accept(PyObject *self, PyObject *arguments, PyObject *keywords) {
+    static char *kwlist[] = { "address", "port", "hostlist", "username", "password", "ssl", NULL };
+    const char *address  = NULL;
+    const char *port     = NULL;
+    const char *hostlist = NULL;
+    const char *username = NULL;
+    const char *password = NULL;
+    int ssl = 0;
+    struct pcap_rmtauth auth;
+    char host[RPCAP_HOSTLIST_SIZE];
+    char errbuf[PCAP_ERRBUF_SIZE];
+    SOCKET sock;
+
+    if(FALSE == PyArg_ParseTupleAndKeywords(arguments, keywords, "|zzzzzp", kwlist,
+            &address, &port, &hostlist, &username, &password, &ssl)) {
+        return NULL;
+    }
+
+    // libpcap listens on a single global socket, which a second call would replace
+    if(_g_accepting) {
+        PyErr_SetString(pypcap_error, "remoteact_accept() is already waiting in another thread");
+        return NULL;
+    }
+    _g_accepting = 1;
+    _g_accept_cancelled = 0;
+
+    // this blocks until a connection comes; remoteact_cleanup() from another
+    // thread stops it
+    struct pcap_rmtauth *authp = remote_auth(&auth, username, password);
+    Py_BEGIN_ALLOW_THREADS
+        sock = pcap_remoteact_accept_ex(address, port, hostlist, host, authp, ssl, errbuf);
+    Py_END_ALLOW_THREADS
+    _g_accepting = 0;
+
+    // -1, -2 and -3 tell apart failures that all leave a message in errbuf
+    if((SOCKET)-1 == sock || (SOCKET)-2 == sock || (SOCKET)-3 == sock) {
+        PyErr_SetString(pypcap_error, _g_accept_cancelled ? "remoteact_accept() was stopped by remoteact_cleanup()" : errbuf);
+        return NULL;
+    }
+
+    // libpcap owns the connection; remoteact_close(host) ends it
+    return PyUnicode_FromString(host);
+}
+
+
+static PyObject * pypcap_remoteact_list(PyObject *self) {
+    // Whatever size it's given, libpcap appends each host with a limit of
+    // PCAP_ERRBUF_SIZE, so a longer list in a bigger buffer would come back
+    // garbled. At this size it reports the overflow instead.
+    char hostlist[PCAP_ERRBUF_SIZE];
+    char errbuf[PCAP_ERRBUF_SIZE];
+
+    if(0 > pcap_remoteact_list(hostlist, ',', (int)sizeof(hostlist), errbuf)) {
+        PyErr_SetString(pypcap_error, errbuf);
+        return NULL;
+    }
+
+    PyObject *hosts = PyList_New(0);
+    if(NULL == hosts) {
+        return NULL;
+    }
+
+    // each host is followed by the separator
+    char *end;
+    for(char *start = hostlist; NULL != (end = strchr(start, ',')); start = end + 1) {
+        PyObject *host = PyUnicode_FromStringAndSize(start, end - start);
+        if(NULL == host || 0 > PyList_Append(hosts, host)) {
+            Py_XDECREF(host);
+            Py_DECREF(hosts);
+            return NULL;
+        }
+        Py_DECREF(host);
+    }
+
+    return hosts;
+}
+
+
+static PyObject * pypcap_remoteact_close(PyObject *self, PyObject *host) {
+    char errbuf[PCAP_ERRBUF_SIZE];
+
+    const char *text = str_argument(host, "host");
+    if(NULL == text) {
+        return NULL;
+    }
+
+    // keeps the GIL while it removes the host from libpcap's list
+    if(0 > pcap_remoteact_close(text, errbuf)) {
+        PyErr_SetString(pypcap_error, errbuf);
+        return NULL;
+    }
+
+    Py_RETURN_NONE;
+}
+
+
+static PyObject * pypcap_remoteact_cleanup(PyObject *self) {
+    // closes the socket a remoteact_accept() in another thread waits on, so
+    // that call fails; with none waiting, this does nothing
+    if(_g_accepting) {
+        _g_accept_cancelled = 1;
+    }
+    pcap_remoteact_cleanup();
+    Py_RETURN_NONE;
 }
 
 

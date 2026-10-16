@@ -21,5 +21,10 @@ def check(h: pypcap3.handle, dumper: pypcap3.dumper) -> None:
     assert_type(pypcap3.find()['lo']['addresses'][0]['netmask'], str | None)
     assert_type(h.compile('udp', netmask='255.255.255.0').match(b''), bool)
     assert_type(len(h.compile('udp')), int)
+    program = pypcap3.bpf_program(list(pypcap3.compile('udp', linktype=1)))
+    assert_type(program[0], tuple[int, int, int, int])
+    for code, jt, jf, k in program:
+        assert_type(k, int)
+    assert_type(h.bufsize(), int)
     with h.dump_open('copy.pcap') as out:
         assert_type(out, pypcap3.dumper)

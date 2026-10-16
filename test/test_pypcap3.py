@@ -322,6 +322,7 @@ def test_handle_busy_inside_loop(handle, call):
     ('datalink', ()),
     ('list_datalinks', ()),
     ('snapshot', ()),
+    ('bufsize', ()),
     ('fileno', ()),
     ('getnonblock', ()),
     ('setnonblock', (0,)),
@@ -337,7 +338,7 @@ def test_handle_busy_inside_loop(handle, call):
     ('major_version', ()),
     ('minor_version', ()),
     ('is_swapped', ()),
-] + ([] if sys.platform == 'win32' else [
+] + ([('setuserbuffer', (65536,))] if sys.platform == 'win32' else [
     ('get_selectable_fd', ()),
     ('get_required_select_timeout', ()),
 ]))
@@ -391,6 +392,12 @@ def test_snapshot(make_pcap, packets):
     h = pypcap3.open_file(make_pcap(packets, snaplen=1500))
     assert h.snapshot() == 1500
     h.close()
+
+
+def test_bufsize(handle):
+    assert handle.bufsize() > 0
+    with pytest.raises(pypcap3.error, match='not been activated'):
+        pypcap3.create('nosuch0').bufsize()
 
 
 def test_file_handle_rejects_live_only_calls(handle):
@@ -940,7 +947,6 @@ def test_read_from_file_object(make_pcap, packets):
         assert not f.closed
 
 
-@pytest.mark.skipif(sys.platform == 'win32', reason='file objects need POSIX descriptors')
 def test_pipe_between_dumper_and_reader(packets):
     rfd, wfd = os.pipe()
     with pypcap3.open_dead().dump_open(wfd) as dumper:
@@ -953,7 +959,6 @@ def test_pipe_between_dumper_and_reader(packets):
     os.close(rfd)
 
 
-@pytest.mark.skipif(sys.platform == 'win32', reason='file objects need POSIX descriptors')
 def test_read_from_subprocess(make_pcap, packets):
     # the way you would read `tcpdump -w -`
     child = subprocess.Popen(
@@ -1019,6 +1024,75 @@ def test_instructions():
     assert lines[0] == '(000) ldh      [12]'
     assert lines[-1].startswith(f'({len(lines) - 1:03d}) ret ')
     assert pypcap3.open_dead().compile('').instructions() == ['(000) ret      #65535']
+
+
+def test_compile_without_handle():
+    packet = ipv4_udp(53)
+    assert pypcap3.compile('udp port 53').match(ether(packet)) is True
+    assert pypcap3.compile('udp port 53', DLT_RAW).match(packet) is True
+    assert pypcap3.compile('udp port 53', linktype=DLT_RAW).match(ether(packet)) is False
+    assert list(pypcap3.compile('udp port 53')) == list(pypcap3.open_dead().compile('udp port 53'))
+    assert pypcap3.compile('', snaplen=1500).instructions() == ['(000) ret      #1500']
+    assert pypcap3.compile('ip broadcast', netmask='255.255.255.0').match(ether(ipv4_udp(53, dst='10.0.0.255'))) is True
+    # unlike pcap_compile_nopcap, libpcap's error text comes through
+    with pytest.raises(pypcap3.error, match='syntax error'):
+        pypcap3.compile('udp port')
+    with pytest.raises(pypcap3.error, match='netmask'):
+        pypcap3.compile('ip broadcast')
+
+
+# instructions as `tcpdump -ddd -y EN10MB arp` prints them, with its default snaplen
+TCPDUMP_ARP = '''4
+40 0 0 12
+21 0 1 2054
+6 0 0 262144
+6 0 0 0
+'''
+
+
+def test_bpf_program_from_instructions(make_pcap, mixed):
+    program = pypcap3.bpf_program(tuple(map(int, line.split())) for line in TCPDUMP_ARP.splitlines()[1:])
+    assert list(program) == list(pypcap3.compile('arp', snaplen=262144))
+    assert len(program) == 4
+    assert program[0] == (0x28, 0, 0, 12)  # ldh [12]
+    assert program[-1] == (6, 0, 0, 0)     # ret #0
+    with pytest.raises(IndexError):
+        program[4]
+    assert [program.match(frame) for frame in mixed] == [False, False, True, False, False]
+
+    h = pypcap3.open_file(make_pcap(mixed))
+    h.setfilter(program)
+    assert list(h) == [mixed[2]]
+    h.close()
+
+    copy = pypcap3.bpf_program(program)
+    assert list(copy) == list(program)
+    assert copy.instructions() == program.instructions()
+    assert pypcap3.bpf_program([[6, 0, 0, 65535]]).match(b'x') is True
+
+
+@pytest.mark.parametrize('instructions, message', [
+    ([(6, 0, 0)], 'instruction 0 must be'),
+    ([(6, 0, 0, 0), (6, 0, 0, -1)], 'instruction 1 must be'),
+    ([(6, 0, 0, 2**32)], 'instruction 0 must be'),
+    ([(6, 256, 0, 0)], 'instruction 0 must be'),
+    ([(0x10000, 0, 0, 0)], 'instruction 0 must be'),
+    ([(6, 0, 0, '0')], 'instruction 0 must be'),
+    (['6000'], 'instruction 0 must be'),
+    ([], 'invalid BPF program'),
+    ([(0x28, 0, 0, 12)], 'invalid BPF program'),                # no return at the end
+    ([(0x15, 5, 0, 1), (6, 0, 0, 0)], 'invalid BPF program'),   # jumps past the end
+])
+def test_invalid_bpf_program(instructions, message):
+    with pytest.raises(pypcap3.error, match=message):
+        pypcap3.bpf_program(instructions)
+
+
+def test_bpf_program_needs_instructions():
+    with pytest.raises(TypeError):
+        pypcap3.bpf_program()
+    with pytest.raises(TypeError, match='iterable'):
+        pypcap3.bpf_program(5)
 
 
 # link types, timestamp names and file details
@@ -1087,7 +1161,7 @@ def test_dumper_tell(tmp_path):
     assert (tmp_path / 'tell.pcap').stat().st_size == 24 + 2 * 16 + 60 + 100
 
 
-@pytest.mark.skipif(sys.platform == 'win32', reason='file objects need POSIX descriptors')
+@pytest.mark.skipif(sys.platform == 'win32', reason='ftell on a Windows pipe is undefined')
 def test_dumper_tell_on_pipe():
     rfd, wfd = os.pipe()
     try:
@@ -1161,7 +1235,7 @@ def test_module_types(handle, tmp_path):
     # a handle made directly has no device behind it
     with pytest.raises(pypcap3.error, match='no device opened'):
         pypcap3.handle().next()
-    for cls in (pypcap3.bpf_program, pypcap3.dumper, pypcap3.packet_iterator):
+    for cls in (pypcap3.dumper, pypcap3.packet_iterator):
         with pytest.raises(TypeError):
             cls()
 
@@ -1181,12 +1255,44 @@ def test_set_protocol_linux(handle):
         handle.set_protocol_linux(0x0806)
 
 
+# Npcap's rpcap active mode; never run, since CI can't install Npcap
+
+
+@pytest.mark.skipif(sys.platform != 'win32', reason='Npcap only')
+def test_remoteact_without_connections():
+    assert pypcap3.remoteact_list() == []
+    with pytest.raises(pypcap3.error):
+        pypcap3.remoteact_close('192.0.2.1')
+    assert pypcap3.remoteact_cleanup() is None  # nothing is waiting
+
+
+@pytest.mark.skipif(sys.platform != 'win32', reason='Npcap only')
+def test_remoteact_cleanup_stops_accept():
+    errors = []
+
+    def accept():
+        try:
+            pypcap3.remoteact_accept('127.0.0.1', '0')
+        except pypcap3.error as e:
+            errors.append(str(e))
+
+    thread = threading.Thread(target=accept)
+    thread.start()
+    # cleanup only stops an accept that is already listening, so repeat it
+    deadline = time.monotonic() + 10
+    while thread.is_alive() and time.monotonic() < deadline:
+        pypcap3.remoteact_cleanup()
+        thread.join(0.1)
+    assert not thread.is_alive()
+    assert errors == ['remoteact_accept() was stopped by remoteact_cleanup()']
+
+
 # type stubs
 
 
 STUB = pathlib.Path(__file__).resolve().parent.parent / 'pypcap3-stubs' / '__init__.pyi'
 # dunders compared between the stub and the module; others such as __init__ aren't
-DUNDERS = {'__enter__', '__exit__', '__iter__', '__next__', '__len__'}
+DUNDERS = {'__enter__', '__exit__', '__iter__', '__next__', '__len__', '__getitem__'}
 
 
 def _stub_platform(test):
