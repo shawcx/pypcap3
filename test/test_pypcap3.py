@@ -1,5 +1,6 @@
 import os
 import pathlib
+import select
 import signal
 import socket
 import struct
@@ -25,9 +26,11 @@ def pcap_bytes(packets, linktype=LINKTYPE_ETHERNET, snaplen=65535):
 
 
 def read_pcap(path):
-    """(snaplen, linktype, [(ts_sec, ts_usec, orig_len, data), ...]) from a classic pcap file."""
+    """(snaplen, linktype, [(ts_sec, ts_fraction, orig_len, data), ...]) from a classic pcap file.
+
+    ts_fraction is in microseconds, or nanoseconds in a nanosecond file."""
     raw = pathlib.Path(path).read_bytes()
-    endian = '<' if raw[:4] == b'\xd4\xc3\xb2\xa1' else '>'
+    endian = '<' if raw[:4] in (b'\xd4\xc3\xb2\xa1', b'\x4d\x3c\xb2\xa1') else '>'
     snaplen, linktype = struct.unpack(endian + 'II', raw[16:24])
     records, offset = [], 24
     while offset < len(raw):
@@ -283,7 +286,8 @@ def test_loops_run_concurrently_in_threads(make_pcap, packets):
     lambda h: h.next(),
     lambda h: h.loop(print),
     lambda h: h.setfilter('udp'),
-], ids=['close', 'next', 'loop', 'setfilter'])
+    lambda h: h.dispatch(print),
+], ids=['close', 'next', 'loop', 'setfilter', 'dispatch'])
 def test_handle_busy_inside_loop(handle, call):
     with pytest.raises(pypcap3.error, match='busy'):
         handle.loop(lambda data: call(handle))
@@ -310,7 +314,15 @@ def test_handle_busy_inside_loop(handle, call):
     ('setfilter', ('udp',)),
     ('compile', ('udp',)),
     ('dump_open', ('unused.pcap',)),
-])
+    ('dispatch', (print,)),
+    ('set_timeout', (100,)),
+    ('can_set_rfmon', ()),
+    ('list_tstamp_types', ()),
+    ('get_tstamp_precision', ()),
+] + ([] if sys.platform == 'win32' else [
+    ('get_selectable_fd', ()),
+    ('get_required_select_timeout', ()),
+]))
 def test_closed_handle_raises(handle, method, args):
     handle.close()
     with pytest.raises(pypcap3.error, match='no device opened'):
@@ -620,3 +632,221 @@ def test_dumper_busy_while_loop_writes_to_it(packets, tmp_path):
     dumper.close()
     h.close()
     assert [record[3] for record in read_pcap(out)[2]] == packets[:1]
+
+
+# packet headers
+
+
+def test_next_with_header(handle, packets):
+    for idx, pkt in enumerate(packets):
+        data, ts, orig_len = handle.next(header=True)
+        assert data == pkt
+        assert ts == pytest.approx(1700000000 + idx + (idx * 1000 + 7) / 1e6, abs=1e-6)
+        assert orig_len == len(pkt)
+    assert handle.next(header=True) is None
+
+
+def test_header_reports_original_length(tmp_path):
+    path = tmp_path / 'truncated.pcap'
+    with pypcap3.open_dead(snaplen=64).dump_open(path) as dumper:
+        dumper.write(b'\x01' * 100, ts=5)
+    assert pypcap3.open_file(str(path)).next(header=True) == (b'\x01' * 64, 5.0, 100)
+
+
+def test_loop_with_header(handle, packets):
+    seen = []
+    handle.loop(lambda *args: seen.append(args), header=True)
+    assert [(data, orig_len) for data, _, orig_len in seen] == [(pkt, len(pkt)) for pkt in packets]
+
+
+def test_loop_into_dumper_write_with_header(make_pcap, packets, tmp_path):
+    # dumper.write takes (packet, ts, orig_len), so it can be the callback directly
+    source = make_pcap(packets)
+    out = tmp_path / 'copy.pcap'
+    h = pypcap3.open_file(source)
+    with h.dump_open(out) as dumper:
+        h.loop(dumper.write, header=True)
+    assert read_pcap(out) == read_pcap(source)
+
+
+def test_header_is_keyword_only(handle):
+    with pytest.raises(TypeError):
+        handle.next(True)
+    with pytest.raises(TypeError):
+        handle.loop(print, -1, True)
+
+
+def test_nanosecond_files(tmp_path):
+    path = tmp_path / 'nano.pcap'
+    dead = pypcap3.open_dead(precision=pypcap3.TSTAMP_PRECISION_NANO)
+    assert dead.get_tstamp_precision() == pypcap3.TSTAMP_PRECISION_NANO
+    with dead.dump_open(path) as dumper:
+        dumper.write(b'\x00' * 60, ts=1.000000123)
+        dumper.write(b'\x00' * 60, ts=2.9999999999)
+    assert [record[:2] for record in read_pcap(path)[2]] == [(1, 123), (3, 0)]
+
+    nano = pypcap3.open_file(str(path), precision=pypcap3.TSTAMP_PRECISION_NANO)
+    assert nano.get_tstamp_precision() == pypcap3.TSTAMP_PRECISION_NANO
+    assert nano.next(header=True)[1] == pytest.approx(1.000000123, abs=1e-12)
+    # read at microsecond precision, libpcap drops the nanoseconds
+    micro = pypcap3.open_file(str(path))
+    assert micro.get_tstamp_precision() == pypcap3.TSTAMP_PRECISION_MICRO
+    assert micro.next(header=True)[1] == 1.0
+
+
+def test_nanosecond_default_timestamp_is_now(tmp_path):
+    path = tmp_path / 'now.pcap'
+    before = time.time()
+    with pypcap3.open_dead(precision=pypcap3.TSTAMP_PRECISION_NANO).dump_open(path) as dumper:
+        dumper.write(b'\x00' * 60)
+    sec, nsec = read_pcap(path)[2][0][:2]
+    assert nsec < 1000000000
+    assert before - 1 <= sec + nsec / 1e9 <= time.time() + 1
+
+
+# dispatch and select
+
+
+def test_dispatch_counts(handle, packets):
+    seen = []
+    assert handle.dispatch(seen.append, 2) == 2
+    assert handle.dispatch(seen.append) == 3
+    assert handle.dispatch(seen.append) == 0
+    assert seen == packets
+
+
+def test_dispatch_with_header(handle, packets):
+    seen = []
+    assert handle.dispatch(lambda *args: seen.append(args), header=True) == len(packets)
+    assert [args[0] for args in seen] == packets
+
+
+def test_dispatch_into_dumper(make_pcap, packets, tmp_path):
+    source = make_pcap(packets)
+    out = tmp_path / 'copy.pcap'
+    h = pypcap3.open_file(source)
+    with h.dump_open(out) as dumper:
+        assert h.dispatch(dumper) == len(packets)
+    assert read_pcap(out) == read_pcap(source)
+
+
+def test_dispatch_callback_exception(handle):
+    def callback(data):
+        raise ValueError('stop')
+
+    with pytest.raises(ValueError, match='stop'):
+        handle.dispatch(callback)
+
+
+def test_breakloop_in_dispatch(handle):
+    seen = []
+
+    def callback(data):
+        seen.append(data)
+        if len(seen) == 2:
+            handle.breakloop()
+
+    assert handle.dispatch(callback) == 2
+
+
+@pytest.mark.skipif(sys.platform == 'win32', reason='no selectable descriptors on Windows')
+def test_select_then_dispatch(packets):
+    # a pipe-backed capture: select() reports it readable only once a packet is written
+    rfd, wfd = os.pipe()
+    os.write(wfd, pcap_bytes([]))
+    try:
+        h = pypcap3.open_file(f'/dev/fd/{rfd}')
+        fd = h.get_selectable_fd()
+        assert fd >= 0
+        assert h.get_required_select_timeout() is None
+        assert select.select([fd], [], [], 0)[0] == []
+        os.write(wfd, pcap_bytes(packets[:1])[24:])
+        assert select.select([fd], [], [], 5)[0] == [fd]
+        seen = []
+        assert h.dispatch(seen.append, 1) == 1
+        assert seen == packets[:1]
+        h.close()
+    finally:
+        os.close(rfd)
+        os.close(wfd)
+
+
+@pytest.mark.skipif(sys.platform == 'win32', reason='needs /dev/fd and pthread_kill')
+def test_sigint_interrupts_blocked_next():
+    rfd, wfd = os.pipe()
+    os.write(wfd, pcap_bytes([]))
+    main = threading.get_ident()
+    done = threading.Event()
+
+    def interrupt():
+        time.sleep(0.3)
+        signal.pthread_kill(main, signal.SIGINT)
+        # if next() is still blocked, end the capture so the test fails instead of hanging
+        if not done.wait(5):
+            os.close(wfd)
+
+    thread = threading.Thread(target=interrupt)
+    thread.start()
+    try:
+        h = pypcap3.open_file(f'/dev/fd/{rfd}')
+        with pytest.raises(KeyboardInterrupt):
+            h.next()
+        h.close()
+    finally:
+        done.set()
+        thread.join()
+        os.close(rfd)
+        try:
+            os.close(wfd)
+        except OSError:
+            pass
+
+
+# settings before activate()
+
+
+def test_create_settings():
+    h = pypcap3.create('nosuch0')
+    assert h.set_timeout(250) is None
+    assert h.set_immediate_mode(True) is None
+    assert h.set_buffer_size(1 << 20) is None
+    assert h.set_rfmon(False) is None
+    assert h.set_tstamp_type(pypcap3.TSTAMP_HOST) is None
+    assert h.set_tstamp_precision(pypcap3.TSTAMP_PRECISION_MICRO) is None
+    try:
+        h.set_tstamp_precision(pypcap3.TSTAMP_PRECISION_NANO)
+    except pypcap3.error as e:
+        # macOS BPF only has microsecond timestamps
+        assert 'precision' in str(e)
+        assert h.get_tstamp_precision() == pypcap3.TSTAMP_PRECISION_MICRO
+    else:
+        assert h.get_tstamp_precision() == pypcap3.TSTAMP_PRECISION_NANO
+    for entry in h.list_tstamp_types():
+        assert len(entry) == 3 and isinstance(entry[0], int)
+    h.close()
+
+
+def test_unsupported_tstamp_type_warns():
+    h = pypcap3.create('nosuch0')
+    assert isinstance(h.set_tstamp_type(pypcap3.TSTAMP_ADAPTER_UNSYNCED), str)
+    h.close()
+
+
+def test_setting_requires_int():
+    with pytest.raises(pypcap3.error, match='timeout must be an integer'):
+        pypcap3.create('nosuch0').set_timeout('100')
+
+
+@pytest.mark.parametrize('setter', [
+    'set_snaplen', 'set_promisc', 'set_timeout', 'set_immediate_mode', 'set_buffer_size',
+    'set_rfmon', 'set_tstamp_type', 'set_tstamp_precision',
+])
+def test_settings_after_activation_raise(handle, setter):
+    with pytest.raises(pypcap3.error, match='activated'):
+        getattr(handle, setter)(0)
+
+
+def test_only_devices_can_rfmon(handle):
+    # libpcap itself crashes if asked on a file or open_dead() handle
+    assert handle.can_set_rfmon() is False
+    assert pypcap3.open_dead().can_set_rfmon() is False

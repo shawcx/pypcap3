@@ -16,11 +16,12 @@ Capture DNS traffic to a file until Ctrl-C (live capture needs root)::
         except KeyboardInterrupt:
             pass
 
-Read it back, or test a filter without a device::
+Read it back with timestamps, or test a filter without a device::
 
     handle = pypcap3.open_file('dns.pcap')
-    for packet in iter(handle.next, None):
-        print(len(packet))
+    while (result := handle.next(header=True)) is not None:
+        packet, ts, orig_len = result
+        print(ts, orig_len)
 
     program = pypcap3.open_dead().compile('udp port 53')
     program.match(packet)  # True

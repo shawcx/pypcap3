@@ -38,6 +38,18 @@ PyMODINIT_FUNC PyInit_pypcap3(void) {
     PyModule_AddIntConstant(mod, "D_OUT",   PCAP_D_OUT);
     PyModule_AddIntConstant(mod, "D_INOUT", PCAP_D_INOUT);
 
+    // TIMESTAMP PRECISIONS AND SOURCES
+    PyModule_AddIntConstant(mod, "TSTAMP_PRECISION_MICRO",  PCAP_TSTAMP_PRECISION_MICRO);
+    PyModule_AddIntConstant(mod, "TSTAMP_PRECISION_NANO",   PCAP_TSTAMP_PRECISION_NANO);
+    PyModule_AddIntConstant(mod, "TSTAMP_HOST",             PCAP_TSTAMP_HOST);
+    PyModule_AddIntConstant(mod, "TSTAMP_HOST_LOWPREC",     PCAP_TSTAMP_HOST_LOWPREC);
+    PyModule_AddIntConstant(mod, "TSTAMP_HOST_HIPREC",      PCAP_TSTAMP_HOST_HIPREC);
+    PyModule_AddIntConstant(mod, "TSTAMP_ADAPTER",          PCAP_TSTAMP_ADAPTER);
+    PyModule_AddIntConstant(mod, "TSTAMP_ADAPTER_UNSYNCED", PCAP_TSTAMP_ADAPTER_UNSYNCED);
+#ifdef PCAP_TSTAMP_HOST_HIPREC_UNSYNCED
+    PyModule_AddIntConstant(mod, "TSTAMP_HOST_HIPREC_UNSYNCED", PCAP_TSTAMP_HOST_HIPREC_UNSYNCED);
+#endif
+
     return mod;
 }
 
@@ -260,13 +272,23 @@ static PyPCAP * pypcap_open_live(PyObject *self, PyObject *arguments) {
     pcap_setmintocopy(pypcap->pd, 14);
 #endif // WIN32
 
+    pypcap->live = 1;
+
     return pypcap;
 }
 
 
-static PyPCAP * pypcap_open_file(PyObject *self, PyObject *filename) {
+static PyPCAP * pypcap_open_file(PyObject *self, PyObject *arguments, PyObject *keywords) {
+    static char *kwlist[] = { "filename", "precision", NULL };
+    PyObject *filename;
+    int precision = PCAP_TSTAMP_PRECISION_MICRO;
     char errbuf[PCAP_ERRBUF_SIZE];
     int ok;
+
+    ok = PyArg_ParseTupleAndKeywords(arguments, keywords, "O|i", kwlist, &filename, &precision);
+    if(FALSE == ok) {
+        return NULL;
+    }
 
     ok = PyUnicode_Check(filename);
     if(FALSE == ok) {
@@ -279,7 +301,8 @@ static PyPCAP * pypcap_open_file(PyObject *self, PyObject *filename) {
         return NULL;
     }
 
-    pypcap->pd = pcap_open_offline(PyUnicode_AsUTF8(filename), errbuf);
+    // libpcap scales the file's timestamps to the requested precision
+    pypcap->pd = pcap_open_offline_with_tstamp_precision(PyUnicode_AsUTF8(filename), precision, errbuf);
     if(NULL == pypcap->pd) {
         PyErr_SetString(pypcap_error, errbuf);
         Py_DECREF(pypcap);
@@ -312,17 +335,20 @@ static PyPCAP * pypcap_create(PyObject *self, PyObject *interface) {
         return NULL;
     }
 
+    pypcap->live = 1;
+
     return pypcap;
 }
 
 
 static PyPCAP * pypcap_open_dead(PyObject *self, PyObject *arguments, PyObject *keywords) {
-    static char *kwlist[] = { "linktype", "snaplen", NULL };
-    int linktype = DLT_EN10MB;
-    int snaplen  = DEFAULT_SNAPLEN;
+    static char *kwlist[] = { "linktype", "snaplen", "precision", NULL };
+    int linktype  = DLT_EN10MB;
+    int snaplen   = DEFAULT_SNAPLEN;
+    int precision = PCAP_TSTAMP_PRECISION_MICRO;
     int ok;
 
-    ok = PyArg_ParseTupleAndKeywords(arguments, keywords, "|ii", kwlist, &linktype, &snaplen);
+    ok = PyArg_ParseTupleAndKeywords(arguments, keywords, "|iii", kwlist, &linktype, &snaplen, &precision);
     if(FALSE == ok) {
         return NULL;
     }
@@ -332,7 +358,7 @@ static PyPCAP * pypcap_open_dead(PyObject *self, PyObject *arguments, PyObject *
         return NULL;
     }
 
-    pypcap->pd = pcap_open_dead(linktype, snaplen);
+    pypcap->pd = pcap_open_dead_with_tstamp_precision(linktype, snaplen, precision);
     if(NULL == pypcap->pd) {
         Py_DECREF(pypcap);
         PyErr_NoMemory();
@@ -391,6 +417,7 @@ static PyObject * pypcap_lookupnet(PyObject *self, PyObject *interface) {
 static int pypcap_init(PyPCAP *self, PyObject *args, PyObject *kwds) {
     self->pd   = NULL;
     self->busy = 0;
+    self->live = 0;
     return 0;
 }
 
@@ -511,45 +538,132 @@ static PyObject * pypcap_datalink(PyPCAP *self) {
 }
 
 
-static PyObject * pypcap_set_snaplen(PyPCAP *self, PyObject *snaplen) {
+// the pcap_set_* options taken before activate(): an int in, None out, or
+// the text of a warning such as an unsupported timestamp type
+static PyObject * set_option(PyPCAP *self, PyObject *value, int (*setter)(pcap_t *, int), const char *name) {
     int ok;
 
     CTXCHECK
 
-    ok = PyLong_Check(snaplen);
+    ok = PyLong_Check(value);
     if(FALSE == ok) {
-        PyErr_SetString(pypcap_error, "snaplen must be an integer");
+        PyErr_Format(pypcap_error, "%s must be an integer", name);
         return NULL;
     }
 
-    ok = pcap_set_snaplen(self->pd, PyLong_AsLong(snaplen));
+    long number = PyLong_AsLong(value);
+    if(-1 == number && PyErr_Occurred()) {
+        return NULL;
+    }
+
+    ok = setter(self->pd, (int)number);
     if(0 > ok) {
         PyErr_SetString(pypcap_error, pcap_statustostr(ok));
         return NULL;
+    }
+    if(0 < ok) {
+        return PyUnicode_FromString(pcap_statustostr(ok));
     }
 
     Py_RETURN_NONE;
 }
 
 
-static PyObject * pypcap_set_promisc(PyPCAP *self, PyObject *promisc) {
-    int ok;
+static PyObject * pypcap_set_snaplen(PyPCAP *self, PyObject *value) {
+    return set_option(self, value, pcap_set_snaplen, "snaplen");
+}
+
+
+static PyObject * pypcap_set_promisc(PyPCAP *self, PyObject *value) {
+    return set_option(self, value, pcap_set_promisc, "promisc");
+}
+
+
+static PyObject * pypcap_set_timeout(PyPCAP *self, PyObject *value) {
+    return set_option(self, value, pcap_set_timeout, "timeout");
+}
+
+
+static PyObject * pypcap_set_immediate_mode(PyPCAP *self, PyObject *value) {
+    return set_option(self, value, pcap_set_immediate_mode, "immediate mode");
+}
+
+
+static PyObject * pypcap_set_buffer_size(PyPCAP *self, PyObject *value) {
+    return set_option(self, value, pcap_set_buffer_size, "buffer size");
+}
+
+
+static PyObject * pypcap_set_rfmon(PyPCAP *self, PyObject *value) {
+    return set_option(self, value, pcap_set_rfmon, "rfmon");
+}
+
+
+static PyObject * pypcap_set_tstamp_type(PyPCAP *self, PyObject *value) {
+    return set_option(self, value, pcap_set_tstamp_type, "timestamp type");
+}
+
+
+static PyObject * pypcap_set_tstamp_precision(PyPCAP *self, PyObject *value) {
+    return set_option(self, value, pcap_set_tstamp_precision, "timestamp precision");
+}
+
+
+static PyObject * pypcap_can_set_rfmon(PyPCAP *self) {
+    CTXCHECK
+
+    // libpcap only implements this for devices; it crashes on files and open_dead() handles
+    if(!self->live) {
+        Py_RETURN_FALSE;
+    }
+
+    int ok = pcap_can_set_rfmon(self->pd);
+    if(0 > ok) {
+        PyErr_SetString(pypcap_error, PCAP_ERROR == ok ? pcap_geterr(self->pd) : pcap_statustostr(ok));
+        return NULL;
+    }
+
+    return PyBool_FromLong(ok);
+}
+
+
+static PyObject * pypcap_list_tstamp_types(PyPCAP *self) {
+    int *types;
 
     CTXCHECK
 
-    ok = PyLong_Check(promisc);
-    if(FALSE == ok) {
-        PyErr_SetString(pypcap_error, "promisc must be boolean or integer");
+    int len = pcap_list_tstamp_types(self->pd, &types);
+    if(0 > len) {
+        PyErr_SetString(pypcap_error, pcap_geterr(self->pd));
         return NULL;
     }
 
-    ok = pcap_set_promisc(self->pd, PyLong_AsLong(promisc));
-    if(0 > ok) {
-        PyErr_SetString(pypcap_error, pcap_statustostr(ok));
+    PyObject *list = PyList_New(len);
+    if(NULL == list) {
+        pcap_free_tstamp_types(types);
         return NULL;
     }
 
-    Py_RETURN_NONE;
+    for(int idx = 0; idx < len; ++idx) {
+        PyObject *value = Py_BuildValue("izz", types[idx],
+            pcap_tstamp_type_val_to_name(types[idx]), pcap_tstamp_type_val_to_description(types[idx]));
+        if(NULL == value) {
+            Py_DECREF(list);
+            pcap_free_tstamp_types(types);
+            return NULL;
+        }
+        PyList_SET_ITEM(list, idx, value);
+    }
+
+    pcap_free_tstamp_types(types);
+
+    return list;
+}
+
+
+static PyObject * pypcap_get_tstamp_precision(PyPCAP *self) {
+    CTXCHECK
+    return PyLong_FromLong(pcap_get_tstamp_precision(self->pd));
 }
 
 
@@ -616,19 +730,33 @@ static PyObject * pypcap_setdirection(PyPCAP *self, PyObject *direction) {
 
 
 //
-// pypcap_loop runs pcap_loop with the GIL released; the handler takes it back
-// for each packet. An exception from the callback, or a pending signal such
-// as Ctrl-C, stops the loop and is raised from loop().
+// loop() and dispatch() run libpcap with the GIL released; the handler takes it
+// back for each packet. An exception from the callback, or a pending signal
+// such as Ctrl-C, stops the loop and is raised from loop() or dispatch().
 //
 typedef struct {
     PyObject      *callback;
     pcap_t        *pd;
     PyThreadState *tstate;
+    pcap_dumper_t *dumper;   // write here instead of calling a callback
+    int            header;   // call callback(packet, ts, orig_len) instead of callback(packet)
+    int            nano;     // the handle's timestamps are in nanoseconds
     int            failed;
+    int            count;    // packets handled; dispatch() returns it
 } loop_ctx;
+
+static int is_nano(pcap_t *pd) {
+    return PCAP_TSTAMP_PRECISION_NANO == pcap_get_tstamp_precision(pd);
+}
+
+// seconds since the epoch; with nanosecond precision libpcap keeps nanoseconds in tv_usec
+static double timestamp_seconds(const struct timeval *ts, int nano) {
+    return (double)ts->tv_sec + (double)ts->tv_usec / (nano ? 1e9 : 1e6);
+}
 
 static void pypcap_handler(u_char *user, const struct pcap_pkthdr *pkt_header, const u_char *pkt_data) {
     loop_ctx *ctx = (loop_ctx *)user;
+    PyObject *retval;
 
     // libpcap may still deliver the rest of the current buffer after pcap_breakloop
     if(ctx->failed) {
@@ -637,7 +765,14 @@ static void pypcap_handler(u_char *user, const struct pcap_pkthdr *pkt_header, c
 
     PyEval_RestoreThread(ctx->tstate);
 
-    PyObject *retval = PyObject_CallFunction(ctx->callback, "y#", pkt_data, (Py_ssize_t)pkt_header->caplen);
+    ctx->count++;
+    if(ctx->header) {
+        retval = PyObject_CallFunction(ctx->callback, "y#dI", pkt_data, (Py_ssize_t)pkt_header->caplen,
+            timestamp_seconds(&pkt_header->ts, ctx->nano), (unsigned int)pkt_header->len);
+    }
+    else {
+        retval = PyObject_CallFunction(ctx->callback, "y#", pkt_data, (Py_ssize_t)pkt_header->caplen);
+    }
     Py_XDECREF(retval);
     if(NULL == retval || 0 > PyErr_CheckSignals()) {
         ctx->failed = 1;
@@ -647,11 +782,19 @@ static void pypcap_handler(u_char *user, const struct pcap_pkthdr *pkt_header, c
     ctx->tstate = PyEval_SaveThread();
 }
 
+// loop(dumper): no Python per packet, so the GIL stays released
+static void dump_handler(u_char *user, const struct pcap_pkthdr *pkt_header, const u_char *pkt_data) {
+    loop_ctx *ctx = (loop_ctx *)user;
+    ctx->count++;
+    pcap_dump((u_char *)ctx->dumper, pkt_header, pkt_data);
+}
+
 //
-// SIGINT hook so Ctrl-C breaks a loop that is blocked waiting for packets.
-// It calls pcap_breakloop and then chains to the previous handler (normally
-// Python's), so loop() can raise KeyboardInterrupt. Only one loop at a time
-// holds the hook; loops started while it is taken can be stopped with breakloop().
+// SIGINT hook so Ctrl-C breaks a loop(), dispatch() or next() that is blocked
+// waiting for packets. It calls pcap_breakloop and then chains to the previous
+// handler (normally Python's), so the call can raise KeyboardInterrupt. Only
+// one call at a time holds the hook; calls made while it is taken can be
+// stopped with breakloop().
 //
 static pcap_t * volatile _g_pd = NULL;
 
@@ -699,23 +842,41 @@ static void unhook_sigint(void) {
 }
 #endif // WIN32
 
+// take the hook for pd unless another call holds it; returns whether it was taken
+static int acquire_sigint(pcap_t *pd) {
+    if(NULL != _g_pd) {
+        return 0;
+    }
+    _g_pd = pd;
+    hook_sigint();
+    return 1;
+}
 
-static PyObject * pypcap_loop(PyPCAP *self, PyObject *arguments) {
+static void release_sigint(int hooked) {
+    if(hooked) {
+        unhook_sigint();
+        _g_pd = NULL;
+    }
+}
+
+
+static PyObject * run_loop(PyPCAP *self, PyObject *arguments, PyObject *keywords, int dispatch) {
+    static char *kwlist[] = { "callback", "cnt", "header", NULL };
     PyObject *callback;
     int cnt = -1;
+    int header = 0;
     int ok;
 
     CTXCHECK
     BUSYCHECK
 
-    ok = PyArg_ParseTuple(arguments, "O|i", &callback, &cnt);
+    ok = PyArg_ParseTupleAndKeywords(arguments, keywords, "O|i$p", kwlist, &callback, &cnt, &header);
     if(FALSE == ok) {
         return NULL;
     }
 
-    loop_ctx ctx = { callback, self->pd, NULL, 0 };
+    loop_ctx ctx = { callback, self->pd, NULL, NULL, header, is_nano(self->pd), 0, 0 };
     pcap_handler handler = pypcap_handler;
-    u_char *user = (u_char *)&ctx;
 
     // packets for a dumper go straight to pcap_dump, keeping their capture timestamps
     PyDumper *dumper = NULL;
@@ -729,8 +890,8 @@ static PyObject * pypcap_loop(PyPCAP *self, PyObject *arguments) {
             PyErr_SetString(pypcap_error, "dumper is busy in loop()");
             return NULL;
         }
-        handler = pcap_dump;
-        user    = (u_char *)dumper->dumper;
+        handler    = dump_handler;
+        ctx.dumper = dumper->dumper;
     }
     else {
         ok = PyCallable_Check(callback);
@@ -740,28 +901,26 @@ static PyObject * pypcap_loop(PyPCAP *self, PyObject *arguments) {
         }
     }
 
-    int hooked = (NULL == _g_pd);
-    if(hooked) {
-        _g_pd = self->pd;
-        hook_sigint();
-    }
+    int hooked = acquire_sigint(self->pd);
 
     self->busy = 1;
     if(dumper) {
         dumper->busy = 1;
     }
     ctx.tstate = PyEval_SaveThread();
-    ok = pcap_loop(self->pd, cnt, handler, user);
+    if(dispatch) {
+        ok = pcap_dispatch(self->pd, cnt, handler, (u_char *)&ctx);
+    }
+    else {
+        ok = pcap_loop(self->pd, cnt, handler, (u_char *)&ctx);
+    }
     PyEval_RestoreThread(ctx.tstate);
     self->busy = 0;
     if(dumper) {
         dumper->busy = 0;
     }
 
-    if(hooked) {
-        unhook_sigint();
-        _g_pd = NULL;
-    }
+    release_sigint(hooked);
 
     if(ctx.failed) {
         // the callback raised, or a signal handler did
@@ -775,18 +934,36 @@ static PyObject * pypcap_loop(PyPCAP *self, PyObject *arguments) {
     }
 
     switch(ok) {
-    case 0:
     case PCAP_ERROR_BREAK:
+        // breakloop() before any packets were processed
         break;
     case PCAP_ERROR:
         PyErr_SetString(pypcap_error, pcap_geterr(self->pd));
         return NULL;
     default:
-        PyErr_SetString(pypcap_error, pcap_statustostr(ok));
-        return NULL;
+        if(0 > ok) {
+            PyErr_SetString(pypcap_error, pcap_statustostr(ok));
+            return NULL;
+        }
     }
 
+    // count packets here rather than trust pcap_dispatch's return value: on a
+    // file, macOS's libpcap 1.10.1 returns 0 when it reaches the end, even
+    // after handling packets
+    if(dispatch) {
+        return PyLong_FromLong(ctx.count);
+    }
     Py_RETURN_NONE;
+}
+
+
+static PyObject * pypcap_loop(PyPCAP *self, PyObject *arguments, PyObject *keywords) {
+    return run_loop(self, arguments, keywords, 0);
+}
+
+
+static PyObject * pypcap_dispatch(PyPCAP *self, PyObject *arguments, PyObject *keywords) {
+    return run_loop(self, arguments, keywords, 1);
 }
 
 
@@ -797,23 +974,40 @@ static PyObject * pypcap_breakloop(PyPCAP *self) {
 }
 
 
-static PyObject * pypcap_next(PyPCAP *self) {
+static PyObject * pypcap_next(PyPCAP *self, PyObject *arguments, PyObject *keywords) {
+    static char *kwlist[] = { "header", NULL };
     struct pcap_pkthdr *hdr;
     const u_char *data;
+    int header = 0;
     int ok;
 
     CTXCHECK
     BUSYCHECK
 
+    ok = PyArg_ParseTupleAndKeywords(arguments, keywords, "|$p", kwlist, &header);
+    if(FALSE == ok) {
+        return NULL;
+    }
+
+    int hooked = acquire_sigint(self->pd);
     self->busy = 1;
     Py_BEGIN_ALLOW_THREADS
         ok = pcap_next_ex(self->pd, &hdr, &data);
     Py_END_ALLOW_THREADS
     self->busy = 0;
+    release_sigint(hooked);
+
+    // as in loop(): Ctrl-C during a blocked read raises KeyboardInterrupt
+    if(0 > ok && 0 > PyErr_CheckSignals()) {
+        return NULL;
+    }
 
     switch(ok) {
     case 1:
-        // TODO: do something more with the header...
+        if(header) {
+            return Py_BuildValue("y#dI", data, (Py_ssize_t)hdr->caplen,
+                timestamp_seconds(&hdr->ts, is_nano(self->pd)), (unsigned int)hdr->len);
+        }
         return PyBytes_FromStringAndSize((const char *)data, hdr->caplen);
     case 0:
     case PCAP_ERROR_BREAK:
@@ -828,11 +1022,33 @@ static PyObject * pypcap_next(PyPCAP *self) {
     }
 }
 
-
 static PyObject * pypcap_fileno(PyPCAP *self) {
     CTXCHECK
     return PyLong_FromLong(pcap_fileno(self->pd));
 }
+
+#ifndef WIN32
+
+static PyObject * pypcap_get_selectable_fd(PyPCAP *self) {
+    CTXCHECK
+    return PyLong_FromLong(pcap_get_selectable_fd(self->pd));
+}
+
+
+// some platforms can't wake select() when packets arrive, so it must time out
+// this often and then call dispatch(); None when there is no such limit
+static PyObject * pypcap_get_required_select_timeout(PyPCAP *self) {
+    CTXCHECK
+
+    const struct timeval *timeout = pcap_get_required_select_timeout(self->pd);
+    if(NULL == timeout) {
+        Py_RETURN_NONE;
+    }
+
+    return PyFloat_FromDouble((double)timeout->tv_sec + (double)timeout->tv_usec / 1e6);
+}
+
+#endif // WIN32
 
 
 static PyObject * pypcap_inject(PyPCAP *self, PyObject *packet) {
@@ -1026,6 +1242,7 @@ static PyObject * pypcap_dump_open(PyPCAP *self, PyObject *arguments, PyObject *
         return NULL;
     }
     dumper->snaplen = pcap_snapshot(self->pd);
+    dumper->nano    = is_nano(self->pd);
     dumper->busy    = 0;
 
     // the file header takes its link type and snaplen from this handle
@@ -1090,8 +1307,14 @@ static PyObject * pypcap_dumper_write(PyDumper *self, PyObject *arguments, PyObj
         return NULL;
     }
 
+    // a nanosecond file keeps nanoseconds in tv_usec
+    long scale = self->nano ? 1000000000 : 1000000;
+
     if(Py_None == ts) {
         timestamp_now(&header.ts);
+        if(self->nano) {
+            header.ts.tv_usec *= 1000;
+        }
     }
     else {
         double seconds = PyFloat_AsDouble(ts);
@@ -1100,13 +1323,13 @@ static PyObject * pypcap_dumper_write(PyDumper *self, PyObject *arguments, PyObj
             return NULL;
         }
         double whole = floor(seconds);
-        long usec = (long)((seconds - whole) * 1e6 + 0.5);
-        if(1000000 <= usec) {
-            whole += 1;
-            usec  -= 1000000;
+        long fraction = (long)((seconds - whole) * scale + 0.5);
+        if(scale <= fraction) {
+            whole    += 1;
+            fraction -= scale;
         }
         header.ts.tv_sec  = (long)whole;
-        header.ts.tv_usec = usec;
+        header.ts.tv_usec = fraction;
     }
 
     // like a capture: store at most snaplen bytes, but record the full length

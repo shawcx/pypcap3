@@ -42,6 +42,7 @@ typedef struct {
     PyObject_HEAD
     pcap_t *pd;
     int busy;      // set while loop() or next() runs with the GIL released
+    int live;      // from open_live() or create(), not a file or open_dead()
 } PyPCAP;
 
 typedef struct {
@@ -53,6 +54,7 @@ typedef struct {
     PyObject_HEAD
     pcap_dumper_t *dumper;
     int snaplen;   // packets longer than this are truncated, as a capture would
+    int nano;      // the file stores nanoseconds rather than microseconds
     int busy;      // set while loop() writes to it with the GIL released
 } PyDumper;
 
@@ -61,7 +63,7 @@ static PyObject * pypcap_find      (PyObject * self);
 static PyObject * pypcap_mac       (PyObject * self, PyObject * interface);
 
 static PyPCAP * pypcap_open_live (PyObject * self, PyObject * arguments);
-static PyPCAP * pypcap_open_file (PyObject * self, PyObject * filename);
+static PyPCAP * pypcap_open_file (PyObject * self, PyObject * arguments, PyObject * keywords);
 static PyPCAP * pypcap_create    (PyObject * self, PyObject * interface);
 static PyPCAP * pypcap_open_dead (PyObject * self, PyObject * arguments, PyObject * keywords);
 
@@ -72,11 +74,14 @@ static PyMethodDef PyPCAP_methods[] = {
     { "find",         (PyCFunction)pypcap_find,      METH_NOARGS,  "find suitable devices in a system" },
     { "mac",          (PyCFunction)pypcap_mac,       METH_O,       "MAC address of an interface"       },
     { "open_live",    (PyCFunction)pypcap_open_live, METH_VARARGS, "open an interface"                 },
-    { "open_file",    (PyCFunction)pypcap_open_file, METH_O,       "open a file"                       },
-    { "open_offline", (PyCFunction)pypcap_open_file, METH_O,       "open a file"                       },
+    { "open_file",    (PyCFunction)pypcap_open_file, METH_VARARGS | METH_KEYWORDS,
+      "open_file(filename, precision=TSTAMP_PRECISION_MICRO): open a capture file" },
+    { "open_offline", (PyCFunction)pypcap_open_file, METH_VARARGS | METH_KEYWORDS,
+      "open_offline(filename, precision=TSTAMP_PRECISION_MICRO): open a capture file" },
     { "create",       (PyCFunction)pypcap_create,    METH_O,       "create a live capture handle"      },
     { "open_dead",    (PyCFunction)pypcap_open_dead, METH_VARARGS | METH_KEYWORDS,
-      "open_dead(linktype=1, snaplen=65535): a handle with no device, for compiling filters and writing files" },
+      "open_dead(linktype=1, snaplen=65535, precision=TSTAMP_PRECISION_MICRO): a handle with no device, "
+      "for compiling filters and writing files" },
     { "lookupnet",    (PyCFunction)pypcap_lookupnet, METH_O,       "(network, netmask) of an interface" },
     { NULL }
 };
@@ -105,10 +110,24 @@ static PyObject * pypcap_set_promisc    (PyPCAP *self, PyObject *promisc);
 static PyObject * pypcap_setnonblock    (PyPCAP *self, PyObject *blocking);
 static PyObject * pypcap_getnonblock    (PyPCAP *self);
 static PyObject * pypcap_setdirection   (PyPCAP *self, PyObject *direction);
-static PyObject * pypcap_loop           (PyPCAP *self, PyObject *arguments);
+static PyObject * pypcap_loop           (PyPCAP *self, PyObject *arguments, PyObject *keywords);
+static PyObject * pypcap_dispatch       (PyPCAP *self, PyObject *arguments, PyObject *keywords);
 static PyObject * pypcap_breakloop      (PyPCAP *self);
-static PyObject * pypcap_next           (PyPCAP *self);
+static PyObject * pypcap_next           (PyPCAP *self, PyObject *arguments, PyObject *keywords);
 static PyObject * pypcap_fileno         (PyPCAP *self);
+#ifndef WIN32
+static PyObject * pypcap_get_selectable_fd           (PyPCAP *self);
+static PyObject * pypcap_get_required_select_timeout (PyPCAP *self);
+#endif // WIN32
+static PyObject * pypcap_set_timeout           (PyPCAP *self, PyObject *value);
+static PyObject * pypcap_set_immediate_mode    (PyPCAP *self, PyObject *value);
+static PyObject * pypcap_set_buffer_size       (PyPCAP *self, PyObject *value);
+static PyObject * pypcap_set_rfmon             (PyPCAP *self, PyObject *value);
+static PyObject * pypcap_can_set_rfmon         (PyPCAP *self);
+static PyObject * pypcap_set_tstamp_type       (PyPCAP *self, PyObject *value);
+static PyObject * pypcap_list_tstamp_types     (PyPCAP *self);
+static PyObject * pypcap_set_tstamp_precision  (PyPCAP *self, PyObject *value);
+static PyObject * pypcap_get_tstamp_precision  (PyPCAP *self);
 static PyObject * pypcap_inject         (PyPCAP *self, PyObject *packet);
 static PyObject * pypcap_setfilter      (PyPCAP *self, PyObject *arguments, PyObject *keywords);
 static PyObject * pypcap_compile        (PyPCAP *self, PyObject *arguments, PyObject *keywords);
@@ -130,10 +149,30 @@ static PyMethodDef PyPCAP_Type_methods[] = {
     { "setnonblock",   (PyCFunction)pypcap_setnonblock,    METH_O,       "set blocking or non-blocking"       },
     { "getnonblock",   (PyCFunction)pypcap_getnonblock,    METH_NOARGS,  "get blocking state"                 },
     { "setdirection",  (PyCFunction)pypcap_setdirection,   METH_O,       "set the direction of a capture"     },
-    { "loop",          (PyCFunction)pypcap_loop,           METH_VARARGS, "call a callback, or write to a dumper, for each packet" },
+    { "loop",          (PyCFunction)pypcap_loop,           METH_VARARGS | METH_KEYWORDS,
+      "loop(callback, cnt=-1, *, header=False): call callback(packet), or callback(packet, ts, orig_len) "
+      "with header=True, for each packet; a dumper is written to directly" },
+    { "dispatch",      (PyCFunction)pypcap_dispatch,       METH_VARARGS | METH_KEYWORDS,
+      "dispatch(callback, cnt=-1, *, header=False): like loop() for one buffer of packets; returns how many" },
     { "breakloop",     (PyCFunction)pypcap_breakloop,      METH_NOARGS,  "cancel the callback function"       },
-    { "next",          (PyCFunction)pypcap_next,           METH_NOARGS,  "read the next packet"               },
+    { "next",          (PyCFunction)pypcap_next,           METH_VARARGS | METH_KEYWORDS,
+      "next(*, header=False): the next packet, (packet, ts, orig_len) with header=True, or None" },
     { "fileno",        (PyCFunction)pypcap_fileno,         METH_NOARGS,  "fetch file descriptor"              },
+#ifndef WIN32
+    { "get_selectable_fd",           (PyCFunction)pypcap_get_selectable_fd,           METH_NOARGS,
+      "descriptor to wait on with select/poll/asyncio, or -1" },
+    { "get_required_select_timeout", (PyCFunction)pypcap_get_required_select_timeout, METH_NOARGS,
+      "seconds a select() must time out after on this handle, or None" },
+#endif // WIN32
+    { "set_timeout",          (PyCFunction)pypcap_set_timeout,          METH_O,      "set the read timeout in ms, before activate()"  },
+    { "set_immediate_mode",   (PyCFunction)pypcap_set_immediate_mode,   METH_O,      "deliver packets as they arrive, before activate()" },
+    { "set_buffer_size",      (PyCFunction)pypcap_set_buffer_size,      METH_O,      "set the buffer size in bytes, before activate()" },
+    { "set_rfmon",            (PyCFunction)pypcap_set_rfmon,            METH_O,      "set Wi-Fi monitor mode, before activate()"     },
+    { "can_set_rfmon",        (PyCFunction)pypcap_can_set_rfmon,        METH_NOARGS, "whether monitor mode is available"             },
+    { "set_tstamp_type",      (PyCFunction)pypcap_set_tstamp_type,      METH_O,      "set a TSTAMP_* source, before activate()"      },
+    { "list_tstamp_types",    (PyCFunction)pypcap_list_tstamp_types,    METH_NOARGS, "(type, name, description) of each timestamp source" },
+    { "set_tstamp_precision", (PyCFunction)pypcap_set_tstamp_precision, METH_O,      "set TSTAMP_PRECISION_MICRO or _NANO, before activate()" },
+    { "get_tstamp_precision", (PyCFunction)pypcap_get_tstamp_precision, METH_NOARGS, "TSTAMP_PRECISION_MICRO or _NANO"               },
     { "inject",        (PyCFunction)pypcap_inject,         METH_O,       "send a packet on the interface"     },
     { "setfilter",     (PyCFunction)pypcap_setfilter,      METH_VARARGS | METH_KEYWORDS,
       "setfilter(filter, optimize=True, netmask=None): apply a BPF expression or a compiled program" },
